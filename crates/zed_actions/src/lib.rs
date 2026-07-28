@@ -421,6 +421,19 @@ pub mod project_panel {
         ]
     );
 }
+pub mod engine_panel {
+    use gpui::actions;
+
+    actions!(
+        engine_panel,
+        [
+            /// Toggles the engine panel.
+            Toggle,
+            /// Toggles focus on the engine panel.
+            ToggleFocus
+        ]
+    );
+}
 pub mod feedback {
     use gpui::actions;
 

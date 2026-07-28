@@ -64,6 +64,7 @@ members = [
     "crates/editor",
     "crates/editor_benchmarks",
     "crates/encoding_selector",
+    "crates/engine_panel",
     "crates/env_var",
     "crates/etw_tracing",
     "crates/eval_cli",
@@ -329,6 +330,7 @@ diagnostics = { path = "crates/diagnostics" }
 dialoguer = { version = "0.12", default-features = false }
 editor = { path = "crates/editor" }
 encoding_selector = { path = "crates/encoding_selector" }
+engine_panel = { path = "crates/engine_panel" }
 env_var = { path = "crates/env_var" }
 etw_tracing = { path = "crates/etw_tracing" }
 eval_utils = { path = "crates/eval_utils" }

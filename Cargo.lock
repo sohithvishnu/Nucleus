@@ -5976,6 +5976,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3d8a32ae18130a3c84dd492d4215c3d913c3b07c6b63c2eb3eb7ff1101ab7bf"
 
 [[package]]
+name = "engine_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "gpui",
+ "theme",
+ "ui",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "enumflags2"
 version = "0.7.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23234,6 +23247,7 @@ dependencies = [
  "edit_prediction_ui",
  "editor",
  "encoding_selector",
+ "engine_panel",
  "env_logger 0.11.8",
  "etw_tracing",
  "extension",
