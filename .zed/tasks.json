@@ -1,5 +1,19 @@
 [
   {
+    "label": "Run tests",
+    "command": "cargo",
+    "args": [
+      "nextest",
+      "run",
+      "--workspace",
+      "--no-fail-fast",
+      "--failure-output",
+      "immediate-final",
+    ],
+    "allow_concurrent_runs": true,
+    "use_new_terminal": false,
+  },
+  {
     "label": "clippy",
     "command": "./script/clippy",
     "args": [],

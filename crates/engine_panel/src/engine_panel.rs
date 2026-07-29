@@ -189,6 +189,14 @@ impl EnginePanel {
                             "last diff",
                             state.diff_summary.unwrap_or_else(|| "—".to_string()),
                         )),
+                )
+                .child(
+                    Label::new(
+                        "Task runs are detected via Zed's task runner only (task::Spawn) — \
+                        commands typed directly into a plain shell terminal aren't seen.",
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
                 ),
         )
     }

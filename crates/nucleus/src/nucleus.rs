@@ -11,12 +11,13 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use collections::VecDeque;
+use collections::{HashMap, VecDeque};
 use editor::{Editor, EditorEvent};
-use gpui::{App, Context, Entity, Subscription, Task};
+use gpui::{App, Context, Entity, EntityId, Subscription, Task, WeakEntity};
 use language::{Buffer, BufferEvent};
 use project::Project;
 use terminal_view::TerminalView;
+use terminal_view::terminal_panel::TerminalPanel;
 use workspace::Workspace;
 use workspace::item::ItemHandle;
 
@@ -25,7 +26,11 @@ use workspace::item::ItemHandle;
 /// Provisional: this is a guess, not tuned against real usage yet.
 const RECENT_WINDOW: Duration = Duration::from_secs(5 * 60);
 
-/// How often stale activity is pruned from the rolling window.
+/// How often stale activity is pruned from the rolling window, and how often
+/// the terminal dock is polled for newly-completed task terminals (see
+/// [`NucleusEngine::poll_task_terminals`] for why polling rather than an
+/// item-added event is used). Worst-case task-completion detection latency
+/// is one interval; provisional, not tuned against real usage yet.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Number of most-recently-touched files retained for display.
@@ -131,6 +136,15 @@ pub struct NucleusEngine {
     test_run_outcomes: VecDeque<(Instant, bool)>,
     last_activity_at: Instant,
 
+    workspace: WeakEntity<Workspace>,
+    /// Most recently observed `TaskStatus` per task-terminal, keyed by the
+    /// terminal's `EntityId`. Used to detect the `Running` -> `Completed`
+    /// transition rather than just "is this terminal currently completed" —
+    /// terminals are commonly reused across reruns (`task::Rerun` defaults to
+    /// `use_new_terminal: false`), so a plain "have we ever seen this
+    /// terminal" set would only ever count the first run in a reused tab.
+    last_seen_task_status: HashMap<EntityId, terminal::TaskStatus>,
+
     _subscriptions: Vec<Subscription>,
     _project_subscription: Option<Subscription>,
     _active_item_subscriptions: Vec<Subscription>,
@@ -139,6 +153,7 @@ pub struct NucleusEngine {
 
 impl NucleusEngine {
     pub fn new(workspace: Entity<Workspace>, cx: &mut Context<Self>) -> Self {
+        let weak_workspace = workspace.downgrade();
         let workspace_subscription = cx.subscribe(&workspace, Self::handle_workspace_event);
 
         let decay_task = cx.spawn(async move |this, cx| {
@@ -183,6 +198,8 @@ impl NucleusEngine {
             file_switch_timestamps: VecDeque::new(),
             test_run_outcomes: VecDeque::new(),
             last_activity_at: Instant::now(),
+            workspace: weak_workspace,
+            last_seen_task_status: HashMap::default(),
             _subscriptions: vec![workspace_subscription],
             _project_subscription: None,
             _active_item_subscriptions: Vec::new(),
@@ -209,15 +226,9 @@ impl NucleusEngine {
         event: &workspace::Event,
         cx: &mut Context<Self>,
     ) {
-        match event {
-            workspace::Event::ActiveItemChanged => {
-                this.sync_active_item(&workspace, cx);
-                this.refresh(cx);
-            }
-            workspace::Event::ItemAdded { item } => {
-                this.observe_possible_task_terminal(item.as_ref(), cx);
-            }
-            _ => {}
+        if let workspace::Event::ActiveItemChanged = event {
+            this.sync_active_item(&workspace, cx);
+            this.refresh(cx);
         }
     }
 
@@ -334,27 +345,52 @@ impl NucleusEngine {
         self.recent_files.truncate(MAX_ACTIVE_FILES);
     }
 
-    fn observe_possible_task_terminal(&mut self, item: &dyn ItemHandle, cx: &mut Context<Self>) {
-        let Some(terminal_view) = item.act_as::<TerminalView>(cx) else {
+    /// Scans the terminal dock's panes for task terminals that have finished,
+    /// recording each one's outcome exactly once.
+    ///
+    /// This polls rather than reacting to `workspace::Event::ItemAdded`
+    /// because task terminals never actually fire that event: `TerminalPanel`
+    /// owns its panes directly and subscribes to them with its own
+    /// `handle_pane_event`, so `pane::Event::AddItem` is forwarded into
+    /// `TerminalPanel`'s internal state, not into `Workspace`'s event stream.
+    /// (Confirmed by reading `terminal_panel.rs`'s `add_terminal_task`, which
+    /// adds the terminal view straight to the panel's own pane.) Polling
+    /// `TerminalPanel::panes()` sidesteps that entirely and also covers
+    /// terminals reused across reruns and terminals in split panes.
+    fn poll_task_terminals(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let terminal = terminal_view.read(cx).terminal().clone();
-        if terminal.read(cx).task().is_none() {
+        let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
             return;
+        };
+
+        let mut newly_observed = Vec::new();
+        for pane in terminal_panel.read(cx).panes() {
+            for terminal_view in pane.read(cx).items_of_type::<TerminalView>() {
+                let terminal = terminal_view.read(cx).terminal();
+                let Some(task) = terminal.read(cx).task() else {
+                    continue;
+                };
+                let status = task.status;
+                let entity_id = terminal.entity_id();
+                let previous_status = self.last_seen_task_status.insert(entity_id, status);
+                if let terminal::TaskStatus::Completed { success } = status
+                    && !matches!(previous_status, Some(terminal::TaskStatus::Completed { .. }))
+                {
+                    newly_observed.push(success);
+                }
+            }
         }
 
-        let completion = terminal.read(cx).wait_for_completed_task(cx);
-        cx.spawn(async move |this, cx| {
-            let exit_status = completion.await;
-            this.update(cx, |this, cx| {
-                let success = exit_status.map(|status| status.success()).unwrap_or(false);
-                this.test_run_outcomes.push_back((Instant::now(), success));
-                this.last_activity_at = Instant::now();
-                this.refresh(cx);
-            })
-            .ok();
-        })
-        .detach();
+        if newly_observed.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for success in newly_observed {
+            self.test_run_outcomes.push_back((now, success));
+        }
+        self.last_activity_at = now;
     }
 
     fn prune_and_refresh(&mut self, cx: &mut Context<Self>) {
@@ -364,6 +400,7 @@ impl NucleusEngine {
         self.save_timestamps.retain(|at| *at >= cutoff);
         self.file_switch_timestamps.retain(|at| *at >= cutoff);
         self.test_run_outcomes.retain(|(at, _)| *at >= cutoff);
+        self.poll_task_terminals(cx);
         self.refresh(cx);
     }
 
