@@ -16,10 +16,15 @@ use editor::{Editor, EditorEvent};
 use gpui::{App, Context, Entity, EntityId, Subscription, Task, WeakEntity};
 use language::{Buffer, BufferEvent};
 use project::Project;
+use serde::Serialize;
 use terminal_view::TerminalView;
 use terminal_view::terminal_panel::TerminalPanel;
 use workspace::Workspace;
 use workspace::item::ItemHandle;
+
+mod logging;
+
+pub use logging::{NucleusLogger, RawEvent, log_dir};
 
 /// How far back "recent" activity counters look before decaying away.
 ///
@@ -36,7 +41,13 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(10);
 /// Number of most-recently-touched files retained for display.
 const MAX_ACTIVE_FILES: usize = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// Minimum confidence delta (on top of an unchanged selected intent) that
+/// counts as a "meaningful shift" worth logging an `intent_prediction` line
+/// for. Chosen arbitrarily as "more than a rounding-error-sized move"; not
+/// tuned against real usage yet.
+const CONFIDENCE_LOG_THRESHOLD: f32 = 0.1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
 pub enum DeveloperIntent {
     Debugging,
     Implementing,
@@ -81,7 +92,7 @@ impl DeveloperIntent {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct RecentActions {
     pub test_runs: u32,
     pub failed_test_runs: u32,
@@ -89,13 +100,13 @@ pub struct RecentActions {
     pub file_switches: u32,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct DiagnosticsSummary {
     pub errors: usize,
     pub warnings: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SessionState {
     pub active_files: Vec<PathBuf>,
     pub recent_actions: RecentActions,
@@ -105,7 +116,7 @@ pub struct SessionState {
     pub diff_summary: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct IntentPrediction {
     /// Probability per intent, in [`DeveloperIntent::ALL`] order.
     pub probabilities: Vec<(DeveloperIntent, f32)>,
@@ -145,6 +156,13 @@ pub struct NucleusEngine {
     /// terminal" set would only ever count the first run in a reused tab.
     last_seen_task_status: HashMap<EntityId, terminal::TaskStatus>,
 
+    logger: NucleusLogger,
+    /// The last `IntentPrediction` actually written to the log, compared
+    /// against on every `refresh()` so we only log on a meaningful change
+    /// (selected intent changes, or confidence moves by more than
+    /// `CONFIDENCE_LOG_THRESHOLD`) rather than on every classifier tick.
+    last_logged_prediction: Option<IntentPrediction>,
+
     _subscriptions: Vec<Subscription>,
     _project_subscription: Option<Subscription>,
     _active_item_subscriptions: Vec<Subscription>,
@@ -154,6 +172,7 @@ pub struct NucleusEngine {
 impl NucleusEngine {
     pub fn new(workspace: Entity<Workspace>, cx: &mut Context<Self>) -> Self {
         let weak_workspace = workspace.downgrade();
+        let logger = NucleusLogger::new(cx.background_executor().clone());
         let workspace_subscription = cx.subscribe(&workspace, Self::handle_workspace_event);
 
         let decay_task = cx.spawn(async move |this, cx| {
@@ -200,6 +219,8 @@ impl NucleusEngine {
             last_activity_at: Instant::now(),
             workspace: weak_workspace,
             last_seen_task_status: HashMap::default(),
+            logger,
+            last_logged_prediction: None,
             _subscriptions: vec![workspace_subscription],
             _project_subscription: None,
             _active_item_subscriptions: Vec::new(),
@@ -277,6 +298,9 @@ impl NucleusEngine {
             self._active_item_subscriptions
                 .push(cx.subscribe(&editor, |this, _editor, event, cx| {
                     if let EditorEvent::SelectionsChanged { local: true } = event {
+                        this.logger.log_raw_event(&RawEvent::SelectionChanged {
+                            file: this.active_file_path.clone(),
+                        });
                         this.last_activity_at = Instant::now();
                         this.refresh(cx);
                     }
@@ -328,18 +352,31 @@ impl NucleusEngine {
             "{edit_count} edit(s), +{inserted}/-{deleted} chars in {file_label}"
         ));
 
+        self.logger.log_raw_event(&RawEvent::Edit {
+            file: self.active_file_path.clone(),
+            symbol: self.current_symbol(cx),
+            inserted_chars: inserted,
+            deleted_chars: deleted,
+        });
+
         self.last_activity_at = Instant::now();
         self.refresh(cx);
     }
 
     fn handle_buffer_saved(&mut self, cx: &mut Context<Self>) {
         self.save_timestamps.push_back(Instant::now());
+        self.logger.log_raw_event(&RawEvent::Save {
+            file: self.active_file_path.clone(),
+        });
         self.last_activity_at = Instant::now();
         self.refresh(cx);
     }
 
     fn record_file_switch(&mut self, path: PathBuf) {
         self.file_switch_timestamps.push_back(Instant::now());
+        self.logger.log_raw_event(&RawEvent::FileSwitch {
+            file: path.clone(),
+        });
         self.recent_files.retain(|existing| existing != &path);
         self.recent_files.insert(0, path);
         self.recent_files.truncate(MAX_ACTIVE_FILES);
@@ -373,11 +410,29 @@ impl NucleusEngine {
                     continue;
                 };
                 let status = task.status;
+                let label = task.spawned_task.label.clone();
                 let entity_id = terminal.entity_id();
                 let previous_status = self.last_seen_task_status.insert(entity_id, status);
+
+                if previous_status.is_none() {
+                    self.logger.log_raw_event(&RawEvent::TaskStarted {
+                        label: Some(label.clone()),
+                    });
+                }
+
                 if let terminal::TaskStatus::Completed { success } = status
                     && !matches!(previous_status, Some(terminal::TaskStatus::Completed { .. }))
                 {
+                    let event = if success {
+                        RawEvent::TaskCompleted {
+                            label: Some(label.clone()),
+                        }
+                    } else {
+                        RawEvent::TaskFailed {
+                            label: Some(label.clone()),
+                        }
+                    };
+                    self.logger.log_raw_event(&event);
                     newly_observed.push(success);
                 }
             }
@@ -421,9 +476,30 @@ impl NucleusEngine {
                 .count() as u32,
         };
 
-        self.prediction = classify(&self.session_state, self.last_edit_magnitude);
+        let new_prediction = classify(&self.session_state, self.last_edit_magnitude);
+        if self.is_meaningful_prediction_change(&new_prediction) {
+            self.logger
+                .log_intent_prediction(&new_prediction, &self.session_state);
+            self.last_logged_prediction = Some(new_prediction.clone());
+        }
+        self.prediction = new_prediction;
 
         cx.notify();
+    }
+
+    /// A prediction is worth logging when the selected intent changes, or
+    /// when confidence moves by more than [`CONFIDENCE_LOG_THRESHOLD`] —
+    /// not on every classifier tick, most of which reproduce the same
+    /// conclusion from marginally different session state.
+    fn is_meaningful_prediction_change(&self, new_prediction: &IntentPrediction) -> bool {
+        match &self.last_logged_prediction {
+            None => true,
+            Some(last) => {
+                last.intent != new_prediction.intent
+                    || (last.confidence - new_prediction.confidence).abs()
+                        > CONFIDENCE_LOG_THRESHOLD
+            }
+        }
     }
 
     fn current_symbol(&self, cx: &App) -> Option<String> {
@@ -583,5 +659,93 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
         intent,
         confidence,
         evidence,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Exercises `NucleusLogger`'s real write path (no mocked filesystem or
+    /// injected path) against the actual `~/.nucleus/logs/` directory, to
+    /// verify actual JSONL lines land on disk rather than just that the
+    /// logging code compiles. Logs enough lines to cross `MAX_QUEUE_LEN` so
+    /// the size-triggered immediate flush fires deterministically, without
+    /// needing to fast-forward the executor's virtual clock past the
+    /// timer-based flush path.
+    #[gpui::test]
+    async fn test_logger_writes_real_jsonl_lines(cx: &mut TestAppContext) {
+        let logger = NucleusLogger::new(cx.executor());
+
+        let prediction = IntentPrediction {
+            probabilities: vec![
+                (DeveloperIntent::Debugging, 0.8),
+                (DeveloperIntent::Implementing, 0.2),
+            ],
+            intent: DeveloperIntent::Debugging,
+            confidence: 0.8,
+            evidence: vec![
+                "3 consecutive failed test/task run(s), no passes in the current window"
+                    .to_string(),
+                "2 error diagnostic(s) currently open".to_string(),
+            ],
+        };
+        let session_state = SessionState {
+            active_files: vec![PathBuf::from("crates/nucleus/src/nucleus.rs")],
+            recent_actions: RecentActions {
+                test_runs: 3,
+                failed_test_runs: 3,
+                saves: 1,
+                file_switches: 0,
+            },
+            diagnostics: DiagnosticsSummary {
+                errors: 2,
+                warnings: 0,
+            },
+            current_symbol: Some("fn poll_task_terminals".to_string()),
+            pause_seconds: 12,
+            diff_summary: Some("2 edit(s), +10/-2 chars in nucleus.rs".to_string()),
+        };
+        logger.log_intent_prediction(&prediction, &session_state);
+        logger.log_raw_event(&RawEvent::Edit {
+            file: Some(PathBuf::from("crates/nucleus/src/nucleus.rs")),
+            symbol: Some("fn poll_task_terminals".to_string()),
+            inserted_chars: 10,
+            deleted_chars: 2,
+        });
+        logger.log_raw_event(&RawEvent::TaskFailed {
+            label: Some("Run tests".to_string()),
+        });
+
+        // Cross the logger's internal MAX_QUEUE_LEN (50, private to
+        // logging.rs) to trigger the immediate (non-timer) flush path.
+        const EXTRA_LINES_TO_FORCE_FLUSH: usize = 50;
+        for _ in 0..EXTRA_LINES_TO_FORCE_FLUSH {
+            logger.log_raw_event(&RawEvent::SelectionChanged {
+                file: Some(PathBuf::from("crates/nucleus/src/nucleus.rs")),
+            });
+        }
+
+        cx.executor().run_until_parked();
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let log_path = log_dir().join(format!("{today}.jsonl"));
+        let contents =
+            std::fs::read_to_string(&log_path).expect("logger should have written a real file");
+        let line_count = contents.lines().count();
+        assert!(
+            line_count >= 53,
+            "expected at least 53 lines (1 prediction + 2 events + {EXTRA_LINES_TO_FORCE_FLUSH} selections), got {line_count}"
+        );
+        for line in contents.lines() {
+            let value: serde_json::Value =
+                serde_json::from_str(line).expect("every line must be valid JSON");
+            assert!(value.get("type").is_some(), "line missing `type` field");
+            assert!(
+                value.get("timestamp").is_some(),
+                "line missing `timestamp` field"
+            );
+        }
     }
 }

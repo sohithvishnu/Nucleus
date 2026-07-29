@@ -11752,12 +11752,17 @@ name = "nucleus"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "collections",
  "editor",
  "gpui",
  "language",
  "multi_buffer",
+ "parking_lot",
+ "paths",
  "project",
+ "serde",
+ "serde_json",
  "terminal",
  "terminal_view",
  "text",
