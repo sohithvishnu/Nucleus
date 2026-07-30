@@ -15,7 +15,7 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 /// and state directory paths.
 ///
 /// Forks should change this to avoid colliding with Zed's user data.
-pub const APP_NAME: &str = "Zed";
+pub const APP_NAME: &str = "Nucleus";
 
 /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
 /// Linux/FreeBSD and the macOS `~/.config` fallback.
@@ -121,7 +121,7 @@ pub fn set_custom_data_dir(dir: &str) -> &'static PathBuf {
 /// Returns the path to the configuration directory used by Zed.
 pub fn config_dir() -> &'static PathBuf {
     CONFIG_DIR.get_or_init(|| {
-        if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
+        let path = if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
             custom_dir.join("config")
         } else if cfg!(target_os = "windows") {
             dirs::config_dir()
@@ -136,14 +136,22 @@ pub fn config_dir() -> &'static PathBuf {
             .join(APP_NAME_LOWERCASE)
         } else {
             home_dir().join(".config").join(APP_NAME_LOWERCASE)
+        };
+
+        if !path.exists() {
+            let legacy_path = home_dir().join(".config").join("zed");
+            if legacy_path.exists() {
+                return legacy_path;
+            }
         }
+        path
     })
 }
 
-/// Returns the path to the data directory used by Zed.
+/// Returns the path to the data directory used by Nucleus.
 pub fn data_dir() -> &'static PathBuf {
     CURRENT_DATA_DIR.get_or_init(|| {
-        if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
+        let path = if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
             custom_dir.clone()
         } else if cfg!(target_os = "macos") {
             home_dir()
@@ -162,7 +170,19 @@ pub fn data_dir() -> &'static PathBuf {
                 .join(APP_NAME)
         } else {
             config_dir().clone() // Fallback
+        };
+
+        if !path.exists() {
+            let legacy_path = if cfg!(target_os = "macos") {
+                home_dir().join("Library/Application Support").join("Zed")
+            } else {
+                home_dir().join(".local/share").join("zed")
+            };
+            if legacy_path.exists() {
+                return legacy_path;
+            }
         }
+        path
     })
 }
 

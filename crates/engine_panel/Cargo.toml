@@ -14,9 +14,12 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
+collections.workspace = true
 editor.workspace = true
 gpui.workspace = true
-nucleus.workspace = true
+nucleus_intent.workspace = true
+serde_json.workspace = true
 theme.workspace = true
 ui.workspace = true
 workspace.workspace = true

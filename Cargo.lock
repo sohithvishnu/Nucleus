@@ -280,6 +280,7 @@ dependencies = [
  "language_models",
  "log",
  "lsp",
+ "nucleus_env_vars",
  "parking_lot",
  "paths",
  "pretty_assertions",
@@ -316,7 +317,6 @@ dependencies = [
  "uuid",
  "watch",
  "web_search",
- "zed_env_vars",
  "zlog",
  "zstd",
 ]
@@ -396,6 +396,7 @@ dependencies = [
  "libc",
  "log",
  "nix 0.29.0",
+ "nucleus_credentials_provider",
  "project",
  "release_channel",
  "remote",
@@ -411,7 +412,6 @@ dependencies = [
  "util",
  "uuid",
  "watch",
- "zed_credentials_provider",
 ]
 
 [[package]]
@@ -514,6 +514,7 @@ dependencies = [
  "multi_buffer",
  "node_runtime",
  "notifications",
+ "nucleus_actions",
  "ordered-float 2.10.1",
  "parking_lot",
  "paths",
@@ -552,6 +553,7 @@ dependencies = [
  "time",
  "tree-sitter-md",
  "ui",
+ "ui_input",
  "unicode-script",
  "unicode-segmentation",
  "unindent",
@@ -561,7 +563,6 @@ dependencies = [
  "vim",
  "watch",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -608,11 +609,11 @@ dependencies = [
  "component",
  "gpui",
  "language_model",
+ "nucleus_actions",
  "serde",
  "smallvec",
  "telemetry",
  "ui",
- "zed_actions",
 ]
 
 [[package]]
@@ -1455,6 +1456,7 @@ dependencies = [
  "gpui",
  "markdown_preview",
  "notifications",
+ "nucleus_actions",
  "prompt_store",
  "release_channel",
  "semver",
@@ -1465,7 +1467,6 @@ dependencies = [
  "ui",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -2165,6 +2166,7 @@ dependencies = [
  "lsp",
  "markdown",
  "multi_buffer",
+ "nucleus_actions",
  "project",
  "prompt_store",
  "rand 0.9.4",
@@ -2175,7 +2177,6 @@ dependencies = [
  "theme_settings",
  "ui",
  "util",
- "zed_actions",
 ]
 
 [[package]]
@@ -3204,6 +3205,7 @@ dependencies = [
  "http_client",
  "http_client_tls",
  "log",
+ "nucleus_credentials_provider",
  "objc2-foundation 0.3.2",
  "parking_lot",
  "paths",
@@ -3234,7 +3236,6 @@ dependencies = [
  "util",
  "windows 0.61.3",
  "worktree",
- "zed_credentials_provider",
 ]
 
 [[package]]
@@ -3394,10 +3395,10 @@ dependencies = [
  "language",
  "language_model",
  "log",
+ "nucleus_credentials_provider",
  "serde",
  "serde_json",
  "text",
- "zed_credentials_provider",
  "zeta_prompt",
 ]
 
@@ -3455,6 +3456,7 @@ dependencies = [
  "nanoid",
  "node_runtime",
  "notifications",
+ "nucleus_actions",
  "parking_lot",
  "pretty_assertions",
  "project",
@@ -3497,7 +3499,6 @@ dependencies = [
  "uuid",
  "workspace",
  "worktree",
- "zed_actions",
  "zlog",
 ]
 
@@ -3518,6 +3519,7 @@ dependencies = [
  "livekit_client",
  "menu",
  "notifications",
+ "nucleus_actions",
  "picker",
  "project",
  "release_channel",
@@ -3534,7 +3536,6 @@ dependencies = [
  "ui",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -3594,6 +3595,7 @@ dependencies = [
  "language",
  "log",
  "menu",
+ "nucleus_actions",
  "picker",
  "postage",
  "project",
@@ -3606,7 +3608,6 @@ dependencies = [
  "ui",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -4929,6 +4930,7 @@ dependencies = [
  "indoc",
  "inventory",
  "log",
+ "nucleus_env_vars",
  "paths",
  "release_channel",
  "sqlez",
@@ -4936,7 +4938,6 @@ dependencies = [
  "tempfile",
  "util",
  "uuid",
- "zed_env_vars",
 ]
 
 [[package]]
@@ -5008,6 +5009,7 @@ dependencies = [
  "log",
  "menu",
  "notifications",
+ "nucleus_actions",
  "parking_lot",
  "parse_int",
  "paths",
@@ -5034,7 +5036,6 @@ dependencies = [
  "unindent",
  "util",
  "workspace",
- "zed_actions",
  "zlog",
 ]
 
@@ -5223,6 +5224,7 @@ dependencies = [
  "log",
  "lsp",
  "markdown",
+ "nucleus_actions",
  "pretty_assertions",
  "project",
  "rand 0.9.4",
@@ -5236,7 +5238,6 @@ dependencies = [
  "unindent",
  "util",
  "workspace",
- "zed_actions",
  "zlog",
 ]
 
@@ -5305,7 +5306,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5546,6 +5547,8 @@ dependencies = [
  "lsp",
  "menu",
  "node_runtime",
+ "nucleus_actions",
+ "nucleus_credentials_provider",
  "open_ai",
  "parking_lot",
  "postage",
@@ -5571,8 +5574,6 @@ dependencies = [
  "uuid",
  "workspace",
  "worktree",
- "zed_actions",
- "zed_credentials_provider",
  "zeta_prompt",
  "zlog",
  "zstd",
@@ -5721,6 +5722,7 @@ dependencies = [
  "markdown",
  "menu",
  "multi_buffer",
+ "nucleus_actions",
  "paths",
  "project",
  "regex",
@@ -5733,7 +5735,6 @@ dependencies = [
  "ui",
  "util",
  "workspace",
- "zed_actions",
  "zeta_prompt",
 ]
 
@@ -5774,6 +5775,7 @@ dependencies = [
  "markdown",
  "menu",
  "multi_buffer",
+ "nucleus_actions",
  "ordered-float 2.10.1",
  "parking_lot",
  "pretty_assertions",
@@ -5821,7 +5823,6 @@ dependencies = [
  "uuid",
  "vim_mode_setting",
  "workspace",
- "zed_actions",
  "zlog",
  "ztracing",
 ]
@@ -5980,13 +5981,16 @@ name = "engine_panel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "collections",
  "editor",
  "gpui",
- "nucleus",
+ "nucleus_actions",
+ "nucleus_intent",
+ "serde_json",
  "theme",
  "ui",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -6128,7 +6132,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6454,6 +6458,7 @@ dependencies = [
  "gpui",
  "language",
  "log",
+ "nucleus_actions",
  "num-format",
  "picker",
  "project",
@@ -6470,7 +6475,6 @@ dependencies = [
  "util",
  "vim_mode_setting",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -6601,11 +6605,11 @@ dependencies = [
  "client",
  "extension_host",
  "gpui",
+ "nucleus_actions",
  "system_specs",
  "urlencoding",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -6635,6 +6639,7 @@ dependencies = [
  "gpui",
  "language",
  "menu",
+ "nucleus_actions",
  "open_path_prompt",
  "picker",
  "picker_preview",
@@ -6650,7 +6655,6 @@ dependencies = [
  "ui",
  "util",
  "workspace",
- "zed_actions",
  "zlog",
 ]
 
@@ -7347,7 +7351,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7442,6 +7446,7 @@ dependencies = [
  "menu",
  "multi_buffer",
  "notifications",
+ "nucleus_actions",
  "panel",
  "picker",
  "pretty_assertions",
@@ -7475,7 +7480,6 @@ dependencies = [
  "watch",
  "windows 0.61.3",
  "workspace",
- "zed_actions",
  "zeroize",
  "zlog",
  "ztracing",
@@ -9153,6 +9157,7 @@ dependencies = [
  "fuzzy",
  "gpui",
  "language",
+ "nucleus_actions",
  "project",
  "serde_json",
  "serde_json_lenient",
@@ -9161,7 +9166,6 @@ dependencies = [
  "util",
  "util_macros",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -9586,6 +9590,7 @@ dependencies = [
  "log",
  "menu",
  "notifications",
+ "nucleus_actions",
  "paths",
  "project",
  "search",
@@ -9602,7 +9607,6 @@ dependencies = [
  "ui_input",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -9993,6 +9997,7 @@ dependencies = [
  "language",
  "lsp",
  "menu",
+ "nucleus_actions",
  "project",
  "proto",
  "release_channel",
@@ -10007,7 +10012,6 @@ dependencies = [
  "ui",
  "util",
  "workspace",
- "zed_actions",
  "zlog",
 ]
 
@@ -10165,12 +10169,11 @@ checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
 name = "libmimalloc-sys"
-version = "0.1.44"
+version = "0.1.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "667f4fec20f29dfc6bc7357c582d91796c169ad7e2fce709468aefeb2c099870"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
 dependencies = [
  "cc",
- "libc",
 ]
 
 [[package]]
@@ -10807,6 +10810,7 @@ dependencies = [
  "language",
  "log",
  "markdown",
+ "nucleus_actions",
  "project",
  "serde_json",
  "settings",
@@ -10817,7 +10821,6 @@ dependencies = [
  "urlencoding",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -11140,9 +11143,9 @@ dependencies = [
 
 [[package]]
 name = "mimalloc"
-version = "0.1.48"
+version = "0.1.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1ee66a4b64c74f4ef288bcbb9192ad9c3feaad75193129ac8509af543894fd8"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
 dependencies = [
  "libmimalloc-sys",
 ]
@@ -11236,6 +11239,7 @@ version = "0.1.0"
 dependencies = [
  "command_palette_hooks",
  "gpui",
+ "nucleus_actions",
  "rpc",
  "serde_json",
  "settings",
@@ -11243,7 +11247,6 @@ dependencies = [
  "theme_settings",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -11286,7 +11289,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11628,13 +11631,13 @@ dependencies = [
  "component",
  "futures-lite 1.13.0",
  "gpui",
+ "nucleus_actions",
  "rpc",
  "sum_tree",
  "time",
  "ui",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -11723,7 +11726,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11749,14 +11752,223 @@ dependencies = [
 
 [[package]]
 name = "nucleus"
+version = "1.14.0"
+dependencies = [
+ "acp_thread",
+ "acp_tools",
+ "action_log",
+ "activity_indicator",
+ "agent",
+ "agent-client-protocol",
+ "agent_servers",
+ "agent_settings",
+ "agent_skills",
+ "agent_ui",
+ "anyhow",
+ "ashpd",
+ "askpass",
+ "assets",
+ "audio",
+ "auto_update",
+ "auto_update_ui",
+ "breadcrumbs",
+ "call",
+ "channel",
+ "chrono",
+ "clap",
+ "cli",
+ "client",
+ "clock",
+ "codestral",
+ "collab_ui",
+ "collections",
+ "command_palette",
+ "component",
+ "component_preview",
+ "copilot",
+ "copilot_chat",
+ "copilot_ui",
+ "crashes",
+ "csv_preview",
+ "dap_adapters",
+ "db",
+ "debug_adapter_extension",
+ "debugger_tools",
+ "debugger_ui",
+ "dev_container",
+ "diagnostics",
+ "edit_prediction",
+ "edit_prediction_ui",
+ "editor",
+ "encoding_selector",
+ "engine_panel",
+ "env_logger 0.11.8",
+ "etw_tracing",
+ "extension",
+ "extension_host",
+ "extensions_ui",
+ "feature_flags",
+ "feedback",
+ "file_finder",
+ "fs",
+ "futures 0.3.32",
+ "git",
+ "git_hosting_providers",
+ "git_ui",
+ "go_to_line",
+ "gpui",
+ "gpui_platform",
+ "gpui_tokio",
+ "hdrhistogram",
+ "http_client",
+ "image",
+ "image_viewer",
+ "input_latency_ui",
+ "inspector_ui",
+ "install_cli",
+ "itertools 0.14.0",
+ "journal",
+ "json_schema_store",
+ "keymap_editor",
+ "language",
+ "language_extension",
+ "language_model",
+ "language_models",
+ "language_onboarding",
+ "language_selector",
+ "language_tools",
+ "languages",
+ "line_ending_selector",
+ "log",
+ "lsp_locations",
+ "markdown",
+ "markdown_preview",
+ "menu",
+ "migrator",
+ "mimalloc",
+ "miniprofiler_ui",
+ "node_runtime",
+ "notifications",
+ "nucleus_actions",
+ "nucleus_env_vars",
+ "onboarding",
+ "outline",
+ "outline_panel",
+ "parking_lot",
+ "paths",
+ "picker",
+ "pkg-config",
+ "pretty_assertions",
+ "profiling",
+ "project",
+ "project_panel",
+ "project_symbols",
+ "prompt_store",
+ "proto",
+ "rayon",
+ "recent_projects",
+ "release_channel",
+ "remote",
+ "repl",
+ "reqwest_client",
+ "rope",
+ "sandbox",
+ "search",
+ "semver",
+ "serde",
+ "serde_json",
+ "session",
+ "settings",
+ "settings_profile_selector",
+ "settings_ui",
+ "shellexpand",
+ "sidebar",
+ "smol",
+ "snippet_provider",
+ "snippets_ui",
+ "svg_preview",
+ "sysinfo 0.37.2",
+ "system_specs",
+ "tab_switcher",
+ "task",
+ "tasks_ui",
+ "telemetry",
+ "telemetry_events",
+ "tempfile",
+ "terminal_view",
+ "theme",
+ "theme_extension",
+ "theme_selector",
+ "theme_settings",
+ "time",
+ "time_format",
+ "title_bar",
+ "toolchain_selector",
+ "tracing",
+ "ui",
+ "ui_prompt",
+ "url",
+ "urlencoding",
+ "util",
+ "uuid",
+ "vim",
+ "vim_mode_setting",
+ "watch",
+ "web_search",
+ "web_search_providers",
+ "which_key",
+ "windows 0.61.3",
+ "windows_resources",
+ "workspace",
+ "zed-reqwest",
+ "zlog",
+ "zlog_settings",
+ "ztracing",
+]
+
+[[package]]
+name = "nucleus_actions"
 version = "0.1.0"
 dependencies = [
+ "gpui",
+ "schemars 1.0.4",
+ "serde",
+ "util",
+]
+
+[[package]]
+name = "nucleus_credentials_provider"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "credentials_provider",
+ "futures 0.3.32",
+ "gpui",
+ "paths",
+ "release_channel",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nucleus_env_vars"
+version = "0.1.0"
+dependencies = [
+ "env_var",
+]
+
+[[package]]
+name = "nucleus_intent"
+version = "0.1.0"
+dependencies = [
+ "agent_ui",
  "anyhow",
  "chrono",
  "collections",
  "editor",
  "gpui",
  "language",
+ "lsp",
  "multi_buffer",
  "parking_lot",
  "paths",
@@ -11766,6 +11978,8 @@ dependencies = [
  "terminal",
  "terminal_view",
  "text",
+ "ui",
+ "uuid",
  "workspace",
 ]
 
@@ -12361,6 +12575,7 @@ dependencies = [
  "gpui",
  "menu",
  "notifications",
+ "nucleus_actions",
  "picker",
  "project",
  "schemars 1.0.4",
@@ -12373,7 +12588,6 @@ dependencies = [
  "util",
  "vim_mode_setting",
  "workspace",
- "zed_actions",
  "zlog",
 ]
 
@@ -12656,6 +12870,7 @@ dependencies = [
  "language",
  "lsp",
  "menu",
+ "nucleus_actions",
  "picker",
  "picker_preview",
  "project",
@@ -12667,7 +12882,6 @@ dependencies = [
  "ui",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -12688,6 +12902,7 @@ dependencies = [
  "log",
  "lsp",
  "menu",
+ "nucleus_actions",
  "outline",
  "pretty_assertions",
  "project",
@@ -12702,7 +12917,6 @@ dependencies = [
  "util",
  "workspace",
  "worktree",
- "zed_actions",
 ]
 
 [[package]]
@@ -13632,6 +13846,7 @@ dependencies = [
  "gpui",
  "language",
  "menu",
+ "nucleus_actions",
  "project",
  "schemars 1.0.4",
  "serde",
@@ -13643,7 +13858,6 @@ dependencies = [
  "ui_input",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -13759,6 +13973,7 @@ name = "platform_title_bar"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "nucleus_actions",
  "project",
  "settings",
  "smallvec",
@@ -13767,7 +13982,6 @@ dependencies = [
  "ui",
  "windows 0.61.3",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -14176,6 +14390,7 @@ dependencies = [
  "lsp",
  "markdown",
  "node_runtime",
+ "nucleus_credentials_provider",
  "parking_lot",
  "path",
  "paths",
@@ -14214,7 +14429,6 @@ dependencies = [
  "wax",
  "which 6.0.3",
  "worktree",
- "zed_credentials_provider",
  "zeroize",
  "zlog",
  "ztracing",
@@ -14265,6 +14479,7 @@ dependencies = [
  "markdown_preview",
  "menu",
  "notifications",
+ "nucleus_actions",
  "pretty_assertions",
  "project",
  "rayon",
@@ -14283,7 +14498,6 @@ dependencies = [
  "util",
  "workspace",
  "worktree",
- "zed_actions",
 ]
 
 [[package]]
@@ -15101,6 +15315,7 @@ dependencies = [
  "log",
  "menu",
  "node_runtime",
+ "nucleus_actions",
  "open_path_prompt",
  "ordered-float 2.10.1",
  "paths",
@@ -15121,7 +15336,6 @@ dependencies = [
  "windows-registry 0.6.1",
  "workspace",
  "worktree",
- "zed_actions",
 ]
 
 [[package]]
@@ -15443,6 +15657,7 @@ dependencies = [
  "menu",
  "multi_buffer",
  "nbformat",
+ "nucleus_actions",
  "picker",
  "project",
  "remote",
@@ -15465,7 +15680,6 @@ dependencies = [
  "util",
  "uuid",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -15929,7 +16143,7 @@ dependencies = [
  "errno 0.3.14",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -16447,6 +16661,7 @@ dependencies = [
  "lsp",
  "menu",
  "multi_buffer",
+ "nucleus_actions",
  "picker",
  "picker_preview",
  "pretty_assertions",
@@ -16465,7 +16680,6 @@ dependencies = [
  "util",
  "util_macros",
  "workspace",
- "zed_actions",
  "ztracing",
 ]
 
@@ -16884,6 +17098,7 @@ dependencies = [
  "fuzzy",
  "gpui",
  "menu",
+ "nucleus_actions",
  "picker",
  "project",
  "serde_json",
@@ -16892,7 +17107,6 @@ dependencies = [
  "theme_settings",
  "ui",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -16931,6 +17145,8 @@ dependencies = [
  "language_model",
  "log",
  "menu",
+ "nucleus_actions",
+ "nucleus_credentials_provider",
  "paths",
  "picker",
  "platform_title_bar",
@@ -16956,8 +17172,6 @@ dependencies = [
  "url",
  "util",
  "workspace",
- "zed_actions",
- "zed_credentials_provider",
 ]
 
 [[package]]
@@ -17083,6 +17297,7 @@ dependencies = [
  "menu",
  "node_runtime",
  "notifications",
+ "nucleus_actions",
  "platform_title_bar",
  "pretty_assertions",
  "project",
@@ -17103,7 +17318,6 @@ dependencies = [
  "unicode-segmentation",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -17395,7 +17609,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -17991,9 +18205,9 @@ dependencies = [
  "gpui",
  "language",
  "multi_buffer",
+ "nucleus_actions",
  "ui",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -18455,6 +18669,7 @@ dependencies = [
  "gpui",
  "hex",
  "log",
+ "nucleus_actions",
  "parking_lot",
  "pretty_assertions",
  "proto",
@@ -18465,7 +18680,6 @@ dependencies = [
  "sha2",
  "shellexpand",
  "util",
- "zed_actions",
 ]
 
 [[package]]
@@ -18481,6 +18695,7 @@ dependencies = [
  "itertools 0.14.0",
  "language",
  "menu",
+ "nucleus_actions",
  "picker",
  "project",
  "serde",
@@ -18493,7 +18708,6 @@ dependencies = [
  "ui",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -18536,7 +18750,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.2",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -18632,6 +18846,7 @@ dependencies = [
  "language",
  "log",
  "menu",
+ "nucleus_actions",
  "pretty_assertions",
  "project",
  "regex",
@@ -18652,7 +18867,6 @@ dependencies = [
  "ui",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -18738,6 +18952,7 @@ dependencies = [
  "fuzzy",
  "gpui",
  "log",
+ "nucleus_actions",
  "picker",
  "project",
  "serde",
@@ -18749,7 +18964,6 @@ dependencies = [
  "ui",
  "util",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -18982,6 +19196,7 @@ dependencies = [
  "icons",
  "livekit_client",
  "notifications",
+ "nucleus_actions",
  "platform_title_bar",
  "project",
  "recent_projects",
@@ -19000,7 +19215,6 @@ dependencies = [
  "util",
  "windows 0.61.3",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -20281,6 +20495,7 @@ dependencies = [
  "markdown_preview",
  "menu",
  "multi_buffer",
+ "nucleus_actions",
  "nvim-rs",
  "outline_panel",
  "parking_lot",
@@ -20307,7 +20522,6 @@ dependencies = [
  "util_macros",
  "vim_mode_setting",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -21558,7 +21772,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -22752,6 +22966,7 @@ dependencies = [
  "markdown",
  "menu",
  "node_runtime",
+ "nucleus_actions",
  "parking_lot",
  "postage",
  "pretty_assertions",
@@ -22778,7 +22993,6 @@ dependencies = [
  "util",
  "uuid",
  "windows 0.61.3",
- "zed_actions",
  "zlog",
 ]
 
@@ -23220,182 +23434,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zed"
-version = "1.14.0"
-dependencies = [
- "acp_thread",
- "acp_tools",
- "action_log",
- "activity_indicator",
- "agent",
- "agent-client-protocol",
- "agent_servers",
- "agent_settings",
- "agent_skills",
- "agent_ui",
- "anyhow",
- "ashpd",
- "askpass",
- "assets",
- "audio",
- "auto_update",
- "auto_update_ui",
- "breadcrumbs",
- "call",
- "channel",
- "chrono",
- "clap",
- "cli",
- "client",
- "clock",
- "codestral",
- "collab_ui",
- "collections",
- "command_palette",
- "component",
- "component_preview",
- "copilot",
- "copilot_chat",
- "copilot_ui",
- "crashes",
- "csv_preview",
- "dap_adapters",
- "db",
- "debug_adapter_extension",
- "debugger_tools",
- "debugger_ui",
- "dev_container",
- "diagnostics",
- "edit_prediction",
- "edit_prediction_ui",
- "editor",
- "encoding_selector",
- "engine_panel",
- "env_logger 0.11.8",
- "etw_tracing",
- "extension",
- "extension_host",
- "extensions_ui",
- "feature_flags",
- "feedback",
- "file_finder",
- "fs",
- "futures 0.3.32",
- "git",
- "git_hosting_providers",
- "git_ui",
- "go_to_line",
- "gpui",
- "gpui_platform",
- "gpui_tokio",
- "hdrhistogram",
- "http_client",
- "image",
- "image_viewer",
- "input_latency_ui",
- "inspector_ui",
- "install_cli",
- "itertools 0.14.0",
- "journal",
- "json_schema_store",
- "keymap_editor",
- "language",
- "language_extension",
- "language_model",
- "language_models",
- "language_onboarding",
- "language_selector",
- "language_tools",
- "languages",
- "line_ending_selector",
- "log",
- "lsp_locations",
- "markdown",
- "markdown_preview",
- "menu",
- "migrator",
- "mimalloc",
- "miniprofiler_ui",
- "node_runtime",
- "notifications",
- "onboarding",
- "outline",
- "outline_panel",
- "parking_lot",
- "paths",
- "picker",
- "pkg-config",
- "pretty_assertions",
- "profiling",
- "project",
- "project_panel",
- "project_symbols",
- "prompt_store",
- "proto",
- "rayon",
- "recent_projects",
- "release_channel",
- "remote",
- "repl",
- "reqwest_client",
- "rope",
- "sandbox",
- "search",
- "semver",
- "serde",
- "serde_json",
- "session",
- "settings",
- "settings_profile_selector",
- "settings_ui",
- "shellexpand",
- "sidebar",
- "smol",
- "snippet_provider",
- "snippets_ui",
- "svg_preview",
- "sysinfo 0.37.2",
- "system_specs",
- "tab_switcher",
- "task",
- "tasks_ui",
- "telemetry",
- "telemetry_events",
- "tempfile",
- "terminal_view",
- "theme",
- "theme_extension",
- "theme_selector",
- "theme_settings",
- "time",
- "time_format",
- "title_bar",
- "toolchain_selector",
- "tracing",
- "ui",
- "ui_prompt",
- "url",
- "urlencoding",
- "util",
- "uuid",
- "vim",
- "vim_mode_setting",
- "watch",
- "web_search",
- "web_search_providers",
- "which_key",
- "windows 0.61.3",
- "windows_resources",
- "workspace",
- "zed-reqwest",
- "zed_actions",
- "zed_env_vars",
- "zlog",
- "zlog_settings",
- "ztracing",
-]
-
-[[package]]
 name = "zed-font-kit"
 version = "0.14.1-zed"
 source = "git+https://github.com/zed-industries/font-kit?rev=94b0f28166665e8fd2f53ff6d268a14955c82269#94b0f28166665e8fd2f53ff6d268a14955c82269"
@@ -23500,37 +23538,6 @@ dependencies = [
  "x11rb",
  "xim-ctext",
  "xim-parser",
-]
-
-[[package]]
-name = "zed_actions"
-version = "0.1.0"
-dependencies = [
- "gpui",
- "schemars 1.0.4",
- "serde",
- "util",
-]
-
-[[package]]
-name = "zed_credentials_provider"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "credentials_provider",
- "futures 0.3.32",
- "gpui",
- "paths",
- "release_channel",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "zed_env_vars"
-version = "0.1.0"
-dependencies = [
- "env_var",
 ]
 
 [[package]]

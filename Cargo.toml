@@ -144,6 +144,7 @@ members = [
     "crates/node_runtime",
     "crates/notifications",
     "crates/nucleus",
+    "crates/nucleus_intent",
     "crates/oauth_callback_server",
     "crates/ollama",
     "crates/onboarding",
@@ -233,11 +234,11 @@ members = [
     "crates/worktree",
     "crates/worktree_benchmarks",
     "crates/x_ai",
-    "crates/zed",
-    "crates/zed_actions",
+    "crates/nucleus",
+    "crates/nucleus_actions",
     "crates/windows_resources",
-    "crates/zed_credentials_provider",
-    "crates/zed_env_vars",
+    "crates/nucleus_credentials_provider",
+    "crates/nucleus_env_vars",
     "crates/zeta_prompt",
     "crates/zlog",
     "crates/zlog_settings",
@@ -261,7 +262,7 @@ members = [
     "tooling/perf",
     "tooling/xtask",
 ]
-default-members = ["crates/zed"]
+default-members = ["crates/nucleus"]
 
 [workspace.package]
 publish = false
@@ -411,6 +412,8 @@ net = { path = "crates/net" }
 node_runtime = { path = "crates/node_runtime" }
 notifications = { path = "crates/notifications" }
 nucleus = { path = "crates/nucleus" }
+nucleus_intent = { path = "crates/nucleus_intent" }
+zed = { path = "crates/nucleus", package = "nucleus" }
 oauth_callback_server = { path = "crates/oauth_callback_server" }
 ollama = { path = "crates/ollama" }
 onboarding = { path = "crates/onboarding" }
@@ -498,10 +501,12 @@ web_search_providers = { path = "crates/web_search_providers" }
 workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }
 x_ai = { path = "crates/x_ai" }
-zed = { path = "crates/zed" }
-zed_actions = { path = "crates/zed_actions" }
-zed_credentials_provider = { path = "crates/zed_credentials_provider" }
-zed_env_vars = { path = "crates/zed_env_vars" }
+nucleus_actions = { path = "crates/nucleus_actions" }
+zed_actions = { path = "crates/nucleus_actions", package = "nucleus_actions" }
+nucleus_credentials_provider = { path = "crates/nucleus_credentials_provider" }
+zed_credentials_provider = { path = "crates/nucleus_credentials_provider", package = "nucleus_credentials_provider" }
+nucleus_env_vars = { path = "crates/nucleus_env_vars" }
+zed_env_vars = { path = "crates/nucleus_env_vars", package = "nucleus_env_vars" }
 edit_prediction = { path = "crates/edit_prediction" }
 edit_prediction_metrics = { path = "crates/edit_prediction_metrics" }
 zeta_prompt = { path = "crates/zeta_prompt" }
@@ -1053,7 +1058,7 @@ telemetry_events = { codegen-units = 1 }
 theme_selector = { codegen-units = 1 }
 time_format = { codegen-units = 1 }
 ui_input = { codegen-units = 1 }
-zed_actions = { codegen-units = 1 }
+nucleus_actions = { codegen-units = 1 }
 
 [profile.release]
 debug = "limited"
@@ -1061,7 +1066,7 @@ lto = "thin"
 codegen-units = 1
 
 [profile.release.package]
-zed = { codegen-units = 16 }
+nucleus = { codegen-units = 16 }
 
 [profile.release-fast]
 inherits = "release"

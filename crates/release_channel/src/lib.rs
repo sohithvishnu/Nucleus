@@ -30,7 +30,7 @@ fn compile_time_release_channel_name() -> String {
 
 #[cfg(not(__do_not_set_zed_release_channel))]
 fn compile_time_release_channel_name() -> String {
-    include_str!("../../zed/RELEASE_CHANNEL").trim().to_string()
+    include_str!("../../nucleus/RELEASE_CHANNEL").trim().to_string()
 }
 
 #[doc(hidden)]
@@ -227,10 +227,10 @@ impl ReleaseChannel {
     /// This also has to match the bundle identifier for Zed on macOS.
     pub fn app_id(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "dev.zed.Zed-Dev",
-            ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
-            ReleaseChannel::Preview => "dev.zed.Zed-Preview",
-            ReleaseChannel::Stable => "dev.zed.Zed",
+            ReleaseChannel::Dev => "dev.nucleus.Nucleus-Dev",
+            ReleaseChannel::Nightly => "dev.nucleus.Nucleus-Nightly",
+            ReleaseChannel::Preview => "dev.nucleus.Nucleus-Preview",
+            ReleaseChannel::Stable => "dev.nucleus.Nucleus",
         }
     }
 

@@ -1375,6 +1375,7 @@ impl Render for PanelButtons {
                             let button = IconButton::new((name, is_active_button as u64), icon)
                                 .icon_size(IconSize::Small)
                                 .toggle_state(is_active_button)
+                                .icon_color(Color::Custom(gpui::white().opacity(0.7)))
                                 .selected_icon_color(Color::Custom(gpui::white()))
                                 .tab_index(0isize)
                                 .aria_label(icon_tooltip)
