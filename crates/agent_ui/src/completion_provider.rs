@@ -199,6 +199,18 @@ impl PromptContextAction {
 pub enum PromptLocalCommand {
     ThumbsUp,
     ThumbsDown,
+    /// Starts a new, unfiled chat — the same action as the toolbar's "+"
+    /// button. To start a chat filed under a Chat Cluster instead, use
+    /// `Clusters` and its "+ New thread in this cluster" tile action.
+    NewChat,
+    /// Opens a searchable picker over this project's past threads.
+    History,
+    /// Opens the same picker as `History`, but selecting an entry archives
+    /// that thread instead of switching to it.
+    DeleteThread,
+    /// Opens the Chat Clusters grid (`chat_cluster_picker`) — purely
+    /// organizational, user-created containers for grouping threads.
+    Clusters,
 }
 
 impl PromptLocalCommand {
@@ -206,6 +218,10 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => "helpful",
             Self::ThumbsDown => "not-helpful",
+            Self::NewChat => "new",
+            Self::History => "history",
+            Self::DeleteThread => "delete",
+            Self::Clusters => "clusters",
         }
     }
 
@@ -213,6 +229,10 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => "Positive Feedback",
             Self::ThumbsDown => "Negative Feedback",
+            Self::NewChat => "New Chat",
+            Self::History => "Browse Thread History",
+            Self::DeleteThread => "Delete a Thread",
+            Self::Clusters => "Browse Chat Clusters",
         }
     }
 
@@ -224,6 +244,10 @@ impl PromptLocalCommand {
             Self::ThumbsDown => {
                 "Rate this response as not helpful. Sends the current conversation to the Zed team."
             }
+            Self::NewChat => "Start a new chat.",
+            Self::History => "Search and switch to a past thread in this project.",
+            Self::DeleteThread => "Search for a thread in this project and archive it.",
+            Self::Clusters => "Browse and create Chat Clusters, and file threads under them.",
         }
     }
 
@@ -231,6 +255,10 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => IconName::ThumbsUp,
             Self::ThumbsDown => IconName::ThumbsDown,
+            Self::NewChat => IconName::Plus,
+            Self::History => IconName::Thread,
+            Self::DeleteThread => IconName::Trash,
+            Self::Clusters => IconName::Blocks,
         }
     }
 }

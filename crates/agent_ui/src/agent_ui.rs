@@ -5,6 +5,8 @@ mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
 mod buffer_codegen;
+mod chat_cluster_picker;
+mod chat_cluster_store;
 mod completion_provider;
 mod config_options;
 mod context;
@@ -29,6 +31,7 @@ mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+mod thread_history_picker;
 mod thread_import;
 pub mod thread_metadata_store;
 pub mod thread_worktree_archive;
@@ -191,6 +194,7 @@ pub enum AgentThreadSource {
     AgentPanel,
     GitPanel,
     Sidebar,
+    HistoryPicker,
 }
 
 impl AgentThreadSource {
@@ -199,6 +203,7 @@ impl AgentThreadSource {
             Self::AgentPanel => "agent_panel",
             Self::GitPanel => "git_panel",
             Self::Sidebar => "sidebar",
+            Self::HistoryPicker => "history_picker",
         }
     }
 }
@@ -617,6 +622,7 @@ pub fn init(
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
+    chat_cluster_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);

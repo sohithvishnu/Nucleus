@@ -29,6 +29,7 @@ use util::ResultExt as _;
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
 
 use crate::DEFAULT_THREAD_TITLE;
+use crate::chat_cluster_store::ChatClusterId;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ThreadId(uuid::Uuid);
@@ -142,6 +143,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         worktree_paths: WorktreePaths::from_folder_paths(&entry.folder_paths),
                         remote_connection: None,
                         archived: true,
+                        chat_cluster_id: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -323,6 +325,10 @@ pub struct ThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub archived: bool,
+    /// The organizational "Chat Cluster" (see `chat_cluster_store`) this
+    /// thread is filed under, if any. `None` for threads started outside a
+    /// project's "+ New thread" flow.
+    pub chat_cluster_id: Option<ChatClusterId>,
 }
 
 impl ThreadMetadata {
@@ -632,6 +638,20 @@ impl ThreadMetadataStore {
             .filter(move |s| s.matches_remote_connection(remote_connection))
     }
 
+    /// Returns all threads filed under `chat_cluster_id`, excluding archived
+    /// threads. Linear scan — chat clusters are a lightweight organizational
+    /// grouping with no dedicated index (unlike `entries_for_path`'s
+    /// `threads_by_paths`), which is fine at the scale a single cluster's
+    /// threads are expected to be.
+    pub fn entries_for_chat_cluster(
+        &self,
+        chat_cluster_id: ChatClusterId,
+    ) -> impl Iterator<Item = &ThreadMetadata> {
+        self.threads.values().filter(move |thread| {
+            !thread.archived && thread.chat_cluster_id == Some(chat_cluster_id)
+        })
+    }
+
     /// Returns threads whose `main_worktree_paths` matches the given path list
     /// and remote connection, excluding archived threads. This finds threads
     /// that were opened in a linked worktree but are associated with the given
@@ -713,6 +733,26 @@ impl ThreadMetadataStore {
         }
         let metadata = ThreadMetadata {
             title_override: Some(title_override),
+            ..existing.clone()
+        };
+        self.save(metadata, cx);
+    }
+
+    /// Files (or unfiles, with `None`) a thread under a Chat Cluster.
+    pub fn set_chat_cluster(
+        &mut self,
+        thread_id: ThreadId,
+        chat_cluster_id: Option<ChatClusterId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(existing) = self.entry(thread_id) else {
+            return;
+        };
+        if existing.chat_cluster_id == chat_cluster_id {
+            return;
+        }
+        let metadata = ThreadMetadata {
+            chat_cluster_id,
             ..existing.clone()
         };
         self.save(metadata, cx);
@@ -1290,6 +1330,7 @@ impl ThreadMetadataStore {
         };
         let title = thread_ref.title();
         let title_override = existing_thread.and_then(|t| t.title_override.clone());
+        let chat_cluster_id = existing_thread.and_then(|t| t.chat_cluster_id);
 
         let updated_at = Utc::now();
 
@@ -1350,6 +1391,7 @@ impl ThreadMetadataStore {
             worktree_paths,
             remote_connection,
             archived,
+            chat_cluster_id,
         };
 
         self.save(metadata, cx);
@@ -1462,6 +1504,17 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN chat_project_id BLOB;
+        ),
+        // Renaming "Chat Projects" to "Chat Clusters" in the UI; this column
+        // was already shipped under the old name, so it's renamed via an
+        // additive migration rather than editing the migration above, which
+        // would change its stored text and fail the migration integrity
+        // check (and orphan any existing rows).
+        sql!(
+            ALTER TABLE sidebar_threads RENAME COLUMN chat_project_id TO chat_cluster_id;
+        ),
     ];
 }
 
@@ -1478,7 +1531,7 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override \
+        main_worktree_paths_order, remote_connection, title_override, chat_cluster_id \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1531,10 +1584,11 @@ impl ThreadMetadataDb {
         let title_override = row.title_override.as_ref().map(|t| t.to_string());
         let thread_id = row.thread_id;
         let archived = row.archived;
+        let chat_cluster_id = row.chat_cluster_id;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, chat_cluster_id) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1548,7 +1602,8 @@ impl ThreadMetadataDb {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
-                           title_override = excluded.title_override";
+                           title_override = excluded.title_override, \
+                           chat_cluster_id = excluded.chat_cluster_id";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1563,7 +1618,8 @@ impl ThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&title_override, i)?;
+            i = stmt.bind(&title_override, i)?;
+            stmt.bind(&chat_cluster_id, i)?;
             stmt.exec()
         })
         .await
@@ -1721,6 +1777,8 @@ impl Column for ThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (chat_cluster_id, next): (Option<ChatClusterId>, i32) =
+            Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1787,6 +1845,7 @@ impl Column for ThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 archived,
+                chat_cluster_id,
             },
             next,
         ))
@@ -1877,6 +1936,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
             remote_connection: None,
+            chat_cluster_id: None,
         }
     }
 
@@ -2171,6 +2231,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&second_paths),
             remote_connection: None,
             archived: false,
+            chat_cluster_id: None,
         };
 
         cx.update(|cx| {
@@ -2256,6 +2317,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&project_a_paths),
             remote_connection: None,
             archived: false,
+            chat_cluster_id: None,
         };
 
         cx.update(|cx| {
@@ -2382,6 +2444,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&project_paths),
             remote_connection: None,
             archived: false,
+            chat_cluster_id: None,
         };
 
         cx.update(|cx| {
@@ -3126,6 +3189,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths.clone(),
             remote_connection: None,
+            chat_cluster_id: None,
         };
 
         let remote_linked_thread = ThreadMetadata {
@@ -3140,6 +3204,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths,
             remote_connection: Some(remote_a.clone()),
+            chat_cluster_id: None,
         };
 
         cx.update(|cx| {

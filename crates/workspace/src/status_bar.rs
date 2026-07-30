@@ -257,29 +257,30 @@ impl StatusBar {
                     },
                 )
                 .icon_size(IconSize::Small)
+                .icon_color(Color::Custom(gpui::white().opacity(0.7)))
                 .tab_index(0isize)
-                .aria_label("Browse threads")
+                .aria_label("Browse Chat Clusters")
                 .when(has_notifications, |this| {
                     this.indicator(Indicator::dot().color(Color::Accent))
                         .indicator_border_color(Some(indicator_border))
                 })
                 .tooltip(move |_, cx| {
                     Tooltip::for_action(
-                        "Browse Threads",
-                        &zed_actions::agents_sidebar::ToggleThreadSwitcher::default(),
+                        "Browse Chat Clusters",
+                        &zed_actions::agents_sidebar::ToggleChatClusters,
                         cx,
                     )
                 })
                 .on_click(move |_, window, cx| {
-                    // Opens the thread switcher as a popover (title, diff
-                    // stats, timestamp — same data the full sidebar column
-                    // shows) instead of pushing the workspace narrower to
-                    // make room for a permanent column. The full sidebar
-                    // (drag-reorder, rename, archive, project grouping) is
-                    // still reachable via ToggleWorkspaceSidebar, e.g. from
-                    // the agent panel's overflow menu.
+                    // Opens the Chat Clusters grid as a popover (organize,
+                    // create, and file threads under clusters) instead of
+                    // pushing the workspace narrower to make room for a
+                    // permanent column. The full sidebar (drag-reorder,
+                    // rename, archive, project grouping) is still reachable
+                    // via ToggleWorkspaceSidebar, e.g. from the agent
+                    // panel's overflow menu.
                     window.dispatch_action(
-                        zed_actions::agents_sidebar::ToggleThreadSwitcher::default().boxed_clone(),
+                        zed_actions::agents_sidebar::ToggleChatClusters.boxed_clone(),
                         cx,
                     );
                 })

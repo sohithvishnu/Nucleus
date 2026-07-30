@@ -31,6 +31,7 @@ use crate::ui::{
 use crate::unicode_confusables;
 
 use db::kvp::KeyValueStore;
+use gpui::Action;
 use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
@@ -1162,6 +1163,34 @@ impl ThreadView {
             }
             PromptLocalCommand::ThumbsDown => {
                 self.handle_feedback_click(ThreadFeedback::Negative, window, cx);
+            }
+            PromptLocalCommand::NewChat => {
+                window.dispatch_action(NewThread.boxed_clone(), cx);
+            }
+            PromptLocalCommand::History => {
+                crate::thread_history_picker::ThreadHistoryPicker::toggle(
+                    self.workspace.clone(),
+                    crate::thread_history_picker::ThreadListScope::Workspace,
+                    crate::thread_history_picker::ThreadHistoryPickerMode::Switch,
+                    window,
+                    cx,
+                );
+            }
+            PromptLocalCommand::DeleteThread => {
+                crate::thread_history_picker::ThreadHistoryPicker::toggle(
+                    self.workspace.clone(),
+                    crate::thread_history_picker::ThreadListScope::Workspace,
+                    crate::thread_history_picker::ThreadHistoryPickerMode::Delete,
+                    window,
+                    cx,
+                );
+            }
+            PromptLocalCommand::Clusters => {
+                crate::chat_cluster_picker::ChatClusterPicker::toggle(
+                    self.workspace.clone(),
+                    window,
+                    cx,
+                );
             }
         }
     }
@@ -6953,6 +6982,11 @@ impl ThreadView {
             commands.push(PromptLocalCommand::ThumbsUp);
             commands.push(PromptLocalCommand::ThumbsDown);
         }
+
+        commands.push(PromptLocalCommand::NewChat);
+        commands.push(PromptLocalCommand::History);
+        commands.push(PromptLocalCommand::DeleteThread);
+        commands.push(PromptLocalCommand::Clusters);
 
         commands
     }

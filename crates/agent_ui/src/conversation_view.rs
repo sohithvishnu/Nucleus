@@ -27,7 +27,7 @@ use file_icons::FileIcons;
 use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
-    Action, Animation, AnimationExt, App, ClickEvent, ClipboardItem, CursorStyle, ElementId, Empty,
+    Animation, AnimationExt, App, ClickEvent, ClipboardItem, CursorStyle, ElementId, Empty,
     Entity, EventEmitter, FocusHandle, Focusable, Hsla, ListOffset, ListState, ObjectFit,
     PlatformDisplay, ScrollHandle, SharedString, StyledText, Subscription, Task, TextRun,
     TextStyle, WeakEntity, Window, WindowHandle, div, ease_in_out, img, linear_color_stop,
@@ -3674,7 +3674,7 @@ pub(crate) mod tests {
     use editor::actions::Paste;
     use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _, FeatureFlagAppExt as _};
     use fs::FakeFs;
-    use gpui::{ClipboardItem, EventEmitter, TestAppContext, VisualTestContext, point, size};
+    use gpui::{Action, ClipboardItem, EventEmitter, TestAppContext, VisualTestContext, point, size};
     use parking_lot::Mutex;
     use project::Project;
     use serde_json::json;
@@ -4671,6 +4671,7 @@ pub(crate) mod tests {
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
                         remote_connection: None,
                         archived: false,
+                        chat_cluster_id: None,
                     },
                     cx,
                 );

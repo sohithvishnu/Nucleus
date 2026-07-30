@@ -409,6 +409,13 @@ pub fn init(cx: &mut App) {
                         panel.update(cx, |panel, cx| panel.expand_message_editor(window, cx));
                     }
                 })
+                .register_action(
+                    |workspace, _: &zed_actions::agents_sidebar::ToggleChatClusters, window, cx| {
+                        crate::chat_cluster_picker::ChatClusterPicker::open_in(
+                            workspace, window, cx,
+                        );
+                    },
+                )
                 .register_action(|workspace, _: &OpenSettings, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
@@ -6157,32 +6164,8 @@ impl AgentPanel {
             .child(toolbar_content)
     }
 
-    fn should_render_trial_end_upsell(&self, cx: &mut Context<Self>) -> bool {
-        if TrialEndUpsell::dismissed(cx) {
-            return false;
-        }
-
-        match &self.base_view {
-            BaseView::AgentThread { .. } => {
-                if LanguageModelRegistry::global(cx)
-                    .read(cx)
-                    .default_model()
-                    .is_some_and(|model| {
-                        model.provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
-                    })
-                {
-                    return false;
-                }
-            }
-            BaseView::Terminal { .. } | BaseView::Uninitialized => {
-                return false;
-            }
-        }
-
-        let plan = self.user_store.read(cx).plan();
-        let has_previous_trial = self.user_store.read(cx).trial_started_at().is_some();
-
-        plan.is_some_and(|plan| plan == Plan::ZedFree) && has_previous_trial
+    fn should_render_trial_end_upsell(&self, _cx: &mut Context<Self>) -> bool {
+        false
     }
 
     fn dismiss_ai_onboarding(&mut self, cx: &mut Context<Self>) {
@@ -7908,6 +7891,7 @@ mod tests {
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
                         remote_connection: None,
                         archived: false,
+                        chat_cluster_id: None,
                     },
                     cx,
                 );
