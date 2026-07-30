@@ -1,10 +1,8 @@
-use crate::{
-    ItemHandle, MultiWorkspace, Pane, SidebarSide, ToggleWorkspaceSidebar,
-    sidebar_side_context_menu,
-};
+use crate::{ItemHandle, MultiWorkspace, Pane, SidebarSide, sidebar_side_context_menu};
 use gpui::{
-    Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, Role, SharedString, Styled, Subscription, WeakEntity, Window,
+    Action, Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable,
+    IntoElement, ParentElement, Render, Role, SharedString, Styled, Subscription, WeakEntity,
+    Window,
 };
 use settings::{SettingsContent, update_settings_file};
 use std::{any::TypeId, sync::Arc};
@@ -260,20 +258,30 @@ impl StatusBar {
                 )
                 .icon_size(IconSize::Small)
                 .tab_index(0isize)
-                .aria_label("Open threads sidebar")
+                .aria_label("Browse threads")
                 .when(has_notifications, |this| {
                     this.indicator(Indicator::dot().color(Color::Accent))
                         .indicator_border_color(Some(indicator_border))
                 })
                 .tooltip(move |_, cx| {
-                    Tooltip::for_action("Open Threads Sidebar", &ToggleWorkspaceSidebar, cx)
+                    Tooltip::for_action(
+                        "Browse Threads",
+                        &zed_actions::agents_sidebar::ToggleThreadSwitcher::default(),
+                        cx,
+                    )
                 })
                 .on_click(move |_, window, cx| {
-                    if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
-                        multi_workspace.update(cx, |multi_workspace, cx| {
-                            multi_workspace.toggle_sidebar(window, cx);
-                        });
-                    }
+                    // Opens the thread switcher as a popover (title, diff
+                    // stats, timestamp — same data the full sidebar column
+                    // shows) instead of pushing the workspace narrower to
+                    // make room for a permanent column. The full sidebar
+                    // (drag-reorder, rename, archive, project grouping) is
+                    // still reachable via ToggleWorkspaceSidebar, e.g. from
+                    // the agent panel's overflow menu.
+                    window.dispatch_action(
+                        zed_actions::agents_sidebar::ToggleThreadSwitcher::default().boxed_clone(),
+                        cx,
+                    );
                 })
             });
 
