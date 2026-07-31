@@ -1,49 +1,99 @@
-# Zed
+# Nucleus
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+[![Nucleus](https://img.shields.io/badge/Nucleus-Intent--Aware%20Workspace-blueviolet)](https://github.com/sohithvishnu/Nucleus)
+[![CI](https://github.com/sohithvishnu/Nucleus/actions/workflows/run_tests.yml/badge.svg)](https://github.com/sohithvishnu/Nucleus/actions)
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+**Nucleus** is a high-performance, intent-aware developer environment built on top of [Zed](https://zed.dev). Engineered for extreme speed and intelligence, Nucleus extends standard code editing with a **Passive Observer Engine**, real-time **Intent Classification**, **Engine Telemetry Dashboards**, and streamlined **Agent UI Tooling**.
 
 ---
 
-### Installation
+## Key Features & Tool Design Beyond Zed
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+### 🧠 Intent Engine & Passive Observer (`nucleus_intent`)
+Nucleus includes an inline, low-overhead passive observer that tracks editor, buffer, terminal, and diagnostic activity to infer what you are working on in real time:
+- **Developer Intent Classifier**: Detects developer context automatically (`Debugging`, `Implementing`, `Refactoring`, `Exploring`, `Reviewing`, `Testing`, `Documenting`, `Configuring`, `Planning`, `AgentAssisted`, `Idle`).
+- **Telemetry & Ground-Truth Logging**: Formats and streams raw activity events and intent predictions into structured JSONL logs (`~/.nucleus/logs/`).
+- **Non-Intrusive Feedback Nudges**: Minimalist toast notifications (`FeedbackNudgeToast`) collect user feedback on predicted intents to continuously tune model confidence.
 
-Other platforms are not yet available:
+### 📊 Engine Panel Telemetry Dashboard (`engine_panel`)
+A dedicated workspace dock panel for real-time observability into your workflow and intent classification:
+- **Live State Overview**: Displays current inferred intent, confidence scores, top active files, recent edit burst windows, and diagnostic proximity metrics.
+- **Log Viewer & Inspector**: Live-tails streaming session events and browses past session logs with filtering by date and event type.
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+### 🤖 Enhanced Agent UI & Workspace Tooling
+- **Chat Clusters**: Re-architected project chat grouping in the Agent panel for organizing multi-task AI workflows.
+- **Popover Thread Switcher**: Clean popover thread navigation that replaces static sidebar columns to maximize code viewing area.
+- **Improved AI Parsing & Permission Handling**: Fine-grained handling of stream parsing and tool permission denials.
 
-### Developing Zed
+### 🎨 Nucleus Design & System Polish
+- **Nucleus Theme**: Tailored high-contrast dark theme with dynamic OS title bar color matching.
+- **Refined Dock & Panel Contrast**: Active dock panel styling with high-contrast icon rendering.
+- **Markdown & Git Enhancements**: Direct line-linking in markdown previews and improved staging awareness when discarding git changes.
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+---
 
-### Contributing
+## Installation & Packaging
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+### macOS
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+#### 1. Quick Build & Install (Local Application)
+Build the release binary, package it into a `.app` bundle, ad-hoc sign it, and install directly into `/Applications`:
+```bash
+./script/bundle-mac -i
+```
 
-### Licensing
+#### 2. Create Standalone `.dmg` Installer
+To build a shareable macOS `.dmg` installer:
+```bash
+./script/bundle-mac
+```
+The output `.dmg` will be saved to:
+`target/<architecture>-apple-darwin/release/Zed-<arch>.dmg` (or `target/aarch64-apple-darwin/release/Zed-aarch64.dmg`).
 
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
+#### 3. Fast Debug Build & Auto-Launch
+```bash
+./script/bundle-mac -d -i -o
+```
 
-License information for third party dependencies must be correctly provided for CI to pass.
+### Linux & Windows
+- **Linux**: Run `./script/bundle-linux` or `./script/install.sh`.
+- **Windows**: Run `powershell ./script/bundle-windows.ps1`.
 
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
+---
 
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
+## Terminal CLI Setup
 
-## Sponsorship
+Link the bundled CLI binary to your local bin path to use `zed` / `nucleus` from your terminal:
 
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
+```bash
+mkdir -p ~/.local/bin
+ln -sf "/Applications/Zed.app/Contents/MacOS/cli" ~/.local/bin/zed
+```
+*(Ensure `~/.local/bin` is present in your shell's `$PATH`).*
 
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+---
 
+## Development & Building
+
+### Prerequisites
+- [Rust toolchain](https://rustup.rs/) (managed via `rust-toolchain.toml`)
+- Xcode Command Line Tools (on macOS: `xcode-select --install`)
+
+### Building from Source
+```bash
+# Build all binaries
+cargo build --release --package zed --package cli
+
+# Run tests
+cargo test
+```
+
+---
+
+## Licensing & Attribution
+
+Nucleus is built upon the open-source foundation of Zed.
+- Primary Source Code: **GPL-3.0-or-later**
+- Components & Tooling: **Apache-2.0** where designated
+
+License compliance for dependencies is managed via [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) and specified in `script/licenses/zed-licenses.toml`.
