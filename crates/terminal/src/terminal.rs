@@ -2047,6 +2047,23 @@ impl Terminal {
         self.write_input(input);
     }
 
+    /// Writes raw bytes directly to the PTY for programmatic injection (e.g.
+    /// `nucleus_intent`'s shell-hook installation), without the side effects
+    /// of [`Self::input`]: doesn't set `keyboard_input_sent` (which gates
+    /// auto-close-on-exit) and doesn't complete an in-flight init-command
+    /// handshake. Callers must not mistake this for real user interaction.
+    pub fn write_program_input(&self, input: impl Into<Cow<'static, [u8]>>) {
+        self.write_to_pty(input);
+    }
+
+    /// The shell kind this terminal was launched with — the same computation
+    /// `start_init_command_startup_handshake` uses internally, exposed for
+    /// callers that need to pick shell-specific behavior externally (e.g.
+    /// `nucleus_intent`'s shell-hook injection).
+    pub fn shell_kind(&self) -> ShellKind {
+        self.template.shell.shell_kind(self.path_style.is_windows())
+    }
+
     /// Sends a shell-level marker command and returns a task that completes when
     /// the marker appears in terminal output. Already complete for non-PTY
     /// terminals or those whose child has exited.

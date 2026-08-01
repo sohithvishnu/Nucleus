@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agent_ui::AgentPanel;
-use collections::{HashMap, VecDeque};
+use collections::{HashMap, HashSet, VecDeque};
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyWindowHandle, App, Context, Entity, EntityId, EventEmitter, Focusable, Subscription, Task,
@@ -21,6 +21,7 @@ use gpui::{
 use language::{Buffer, BufferEvent};
 use project::Project;
 use serde::{Deserialize, Serialize};
+use settings::Settings as _;
 use terminal_view::TerminalView;
 use terminal_view::terminal_panel::TerminalPanel;
 use workspace::Workspace;
@@ -28,12 +29,16 @@ use workspace::item::ItemHandle;
 
 mod feedback_toast;
 mod logging;
+mod terminal_watcher;
+mod terminal_watcher_settings;
 
 pub use feedback_toast::FeedbackNudgeToast;
 pub use logging::{
     Feedback, LogEntry, MAX_HISTORY_LINES, NucleusLogger, RawEvent, list_log_dates, log_dir,
     parse_log_line, read_log_file,
 };
+pub use terminal_watcher::{CommandCategory, categorize_command};
+pub use terminal_watcher_settings::NucleusTerminalWatcherSettings;
 
 /// How far back "recent" activity counters look before decaying away.
 ///
@@ -282,6 +287,13 @@ pub struct NucleusEngine {
     /// `use_new_terminal: false`), so a plain "have we ever seen this
     /// terminal" set would only ever count the first run in a reused tab.
     last_seen_task_status: HashMap<EntityId, terminal::TaskStatus>,
+    /// Phase 4b-1: shell-hook injection + marker-driven command tracking for
+    /// plain (non-task) terminals — see `terminal_watcher`.
+    terminal_watcher: terminal_watcher::TerminalCommandWatcher,
+    /// One `Event::Wakeup` subscription per plain terminal currently being
+    /// watched, keyed by the terminal's `EntityId`. Pruned alongside
+    /// `terminal_watcher`'s own state in `poll_plain_terminals`.
+    _terminal_wakeup_subscriptions: HashMap<EntityId, Subscription>,
 
     logger: NucleusLogger,
     /// The last `IntentPrediction` actually written to the log, compared
@@ -385,6 +397,8 @@ impl NucleusEngine {
             last_activity_at: Instant::now(),
             workspace: weak_workspace,
             last_seen_task_status: HashMap::default(),
+            terminal_watcher: terminal_watcher::TerminalCommandWatcher::new(),
+            _terminal_wakeup_subscriptions: HashMap::default(),
             logger,
             last_logged_prediction: None,
             window_handle,
@@ -661,6 +675,126 @@ impl NucleusEngine {
         self.last_activity_at = now;
     }
 
+    /// Phase 4b-1: injects shell hooks into any plain (non-task) terminal
+    /// that hasn't already been injected, and keeps one `Event::Wakeup`
+    /// subscription per plain terminal alive for marker scanning (see
+    /// `handle_terminal_wakeup`). Runs on the same `PRUNE_INTERVAL` cadence
+    /// as `poll_task_terminals` for injection/pruning bookkeeping — the
+    /// actual marker *detection* is reactive to `Event::Wakeup`, not gated
+    /// on this poll interval.
+    ///
+    /// Gated on `terminal.task().is_none()` so this never observes the same
+    /// terminals `poll_task_terminals` already covers. Not unit-tested
+    /// directly: exercising this gate needs a real PTY-backed `Terminal`
+    /// entity (there's no lightweight way to construct one outside
+    /// `crates/terminal`'s own heavier test harness), which is out of
+    /// proportion for this phase-4b-1 session — see
+    /// `terminal_watcher::tests::test_injected_and_task_status_bookkeeping_are_independent`
+    /// for what *is* tested instead: the two pieces of per-terminal state
+    /// (`last_seen_task_status` here, `TerminalCommandWatcher`'s own state)
+    /// are structurally separate collections, so even if this gate were
+    /// somehow bypassed, plain- and task-terminal bookkeeping couldn't
+    /// silently merge into one another.
+    fn poll_plain_terminals(&mut self, cx: &mut Context<Self>) {
+        if !NucleusTerminalWatcherSettings::get_global(cx).enabled {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
+            return;
+        };
+
+        let mut live_ids = HashSet::default();
+        let mut to_inject: Vec<Entity<terminal::Terminal>> = Vec::new();
+        for pane in terminal_panel.read(cx).panes() {
+            for terminal_view in pane.read(cx).items_of_type::<TerminalView>() {
+                let terminal = terminal_view.read(cx).terminal();
+                if terminal.read(cx).task().is_some() {
+                    // Already covered by poll_task_terminals — see this
+                    // method's doc comment.
+                    continue;
+                }
+                let entity_id = terminal.entity_id();
+                live_ids.insert(entity_id);
+                if self.terminal_watcher.needs_injection(entity_id) {
+                    to_inject.push(terminal.clone());
+                }
+            }
+        }
+
+        for terminal in to_inject {
+            let entity_id = terminal.entity_id();
+            let shell_kind = terminal.read(cx).shell_kind();
+            if let Some(script) = terminal_watcher::shell_hook_script(shell_kind) {
+                terminal.update(cx, |terminal, _cx| {
+                    terminal.write_program_input(script.as_bytes());
+                });
+                let subscription = cx.subscribe(&terminal, Self::handle_terminal_wakeup);
+                self._terminal_wakeup_subscriptions
+                    .insert(entity_id, subscription);
+            }
+            // Mark injected either way (including unsupported shells) so we
+            // don't retry every poll tick for a shell we can't hook.
+            self.terminal_watcher.mark_injected(entity_id);
+        }
+
+        self.terminal_watcher.prune(&live_ids);
+        self._terminal_wakeup_subscriptions
+            .retain(|id, _| live_ids.contains(id));
+    }
+
+    /// Reacts to `Event::Wakeup` (new PTY output) on a watched plain
+    /// terminal by scanning its most-recent lines for command start/finish
+    /// markers — see `terminal_watcher`'s module doc comment for why this
+    /// mirrors `crates/terminal`'s own `INIT_COMMAND_STARTUP_MARKER_*`
+    /// pattern instead of relying on OSC 133 (which doesn't exist in this
+    /// fork's terminal stack).
+    fn handle_terminal_wakeup(
+        this: &mut Self,
+        terminal: Entity<terminal::Terminal>,
+        event: &terminal::Event,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(event, terminal::Event::Wakeup) {
+            return;
+        }
+        let entity_id = terminal.entity_id();
+        let lines = terminal
+            .read(cx)
+            .last_n_non_empty_lines(terminal_watcher::MARKER_SEARCH_LINES);
+        let outcomes = this.terminal_watcher.scan_lines(entity_id, &lines);
+        for outcome in outcomes {
+            match outcome {
+                terminal_watcher::TerminalCommandOutcome::Started { command } => {
+                    this.record_raw_event(
+                        RawEvent::TerminalCommandStarted {
+                            command: terminal_watcher::redact_command(&command),
+                        },
+                        cx,
+                    );
+                }
+                terminal_watcher::TerminalCommandOutcome::Finished {
+                    command,
+                    exit_code,
+                    duration,
+                } => {
+                    this.record_raw_event(
+                        RawEvent::TerminalCommandFinished {
+                            command: terminal_watcher::redact_command(&command),
+                            exit_code,
+                            duration_ms: duration.as_millis() as u64,
+                        },
+                        cx,
+                    );
+                }
+            }
+        }
+        this.last_activity_at = Instant::now();
+        this.refresh(cx);
+    }
+
     /// Runs every `PRUNE_INTERVAL`. Also where the window-scoped Part B/C
     /// signals (`contains_focused` needs a `Window`, which none of the
     /// event-triggered call sites for `refresh` below have) get recomputed
@@ -676,6 +810,7 @@ impl NucleusEngine {
         let burst_cutoff = now.checked_sub(EDIT_BURST_WINDOW).unwrap_or(now);
         self.large_edit_timestamps.retain(|at| *at >= burst_cutoff);
         self.poll_task_terminals(cx);
+        self.poll_plain_terminals(cx);
         self.session_state.agent_active = self.compute_agent_active(window, cx);
         self.session_state.focused_pane = self.compute_focused_pane(window, cx);
         self.session_state.cursor_at_diagnostic = self.compute_cursor_at_diagnostic(cx);
@@ -2010,5 +2145,209 @@ mod tests {
             round_tripped.actual_intent,
             Some(DeveloperIntent::Debugging)
         );
+    }
+}
+
+/// Stress/property tests over `classify()`: rather than hand-picking cases
+/// (the `tests` module above), these generate many combinations of
+/// extreme/boundary `SessionState` values — including ones no real
+/// `NucleusEngine` session could ever actually produce — to check the
+/// function's own internal contract holds regardless of input shape. Pure
+/// function, no GPUI involved, so plain `proptest!` is enough.
+#[cfg(test)]
+mod classify_stress_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn focused_pane_strategy() -> impl Strategy<Value = FocusedPane> {
+        prop_oneof![
+            Just(FocusedPane::Editor),
+            Just(FocusedPane::Terminal),
+            Just(FocusedPane::Other),
+        ]
+    }
+
+    fn recent_actions_strategy() -> impl Strategy<Value = RecentActions> {
+        (
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+        )
+            .prop_map(
+                |(test_runs, failed_test_runs, saves, file_switches, large_edits)| {
+                    RecentActions {
+                        test_runs,
+                        // failed_test_runs is meaningless above test_runs in
+                        // any real session, but classify() takes a bare
+                        // SessionState with no cross-field invariants
+                        // enforced by the type system — deliberately
+                        // generated independently to check classify() is
+                        // robust to a shape the real engine would never
+                        // produce, not just shapes it would.
+                        failed_test_runs,
+                        saves,
+                        file_switches,
+                        large_edits,
+                    }
+                },
+            )
+    }
+
+    fn diagnostics_strategy() -> impl Strategy<Value = DiagnosticsSummary> {
+        (any::<usize>(), any::<usize>()).prop_map(|(errors, warnings)| DiagnosticsSummary {
+            errors,
+            warnings,
+        })
+    }
+
+    fn session_state_strategy() -> impl Strategy<Value = SessionState> {
+        (
+            recent_actions_strategy(),
+            diagnostics_strategy(),
+            any::<u64>(),
+            any::<bool>(),
+            focused_pane_strategy(),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(recent_actions, diagnostics, pause_seconds, agent_active, focused_pane, cursor_at_diagnostic)| {
+                    SessionState {
+                        active_files: Vec::new(),
+                        recent_actions,
+                        diagnostics,
+                        current_symbol: None,
+                        pause_seconds,
+                        diff_summary: None,
+                        agent_active,
+                        focused_pane,
+                        cursor_at_diagnostic,
+                    }
+                },
+            )
+    }
+
+    fn last_edit_magnitude_strategy() -> impl Strategy<Value = Option<usize>> {
+        prop_oneof![Just(None), any::<usize>().prop_map(Some)]
+    }
+
+    proptest! {
+        /// The contract every caller of `classify()` relies on, checked
+        /// against thousands of extreme/boundary combinations: never
+        /// panics, always returns a well-formed probability distribution
+        /// (11 entries, one per `DeveloperIntent::ALL`, each finite and in
+        /// [0,1], summing to ~1.0), a finite in-range confidence that
+        /// matches the selected intent's own probability, non-empty
+        /// evidence, and a selected intent that's genuinely at least tied
+        /// for the highest probability (not just claimed to be).
+        #[test]
+        fn classify_never_violates_its_own_contract(
+            state in session_state_strategy(),
+            last_edit_magnitude in last_edit_magnitude_strategy(),
+        ) {
+            let prediction = classify(&state, last_edit_magnitude);
+
+            prop_assert_eq!(
+                prediction.probabilities.len(),
+                DeveloperIntent::ALL.len(),
+                "must return exactly one probability per DeveloperIntent variant"
+            );
+
+            let mut seen = std::collections::HashSet::new();
+            let mut sum = 0.0f32;
+            for (intent, probability) in &prediction.probabilities {
+                prop_assert!(
+                    seen.insert(*intent),
+                    "duplicate intent {intent:?} in probabilities"
+                );
+                prop_assert!(
+                    probability.is_finite(),
+                    "non-finite probability {probability} for {intent:?}, state={state:?}"
+                );
+                prop_assert!(
+                    (-1e-4..=1.0 + 1e-4).contains(probability),
+                    "probability {probability} for {intent:?} out of [0,1], state={state:?}"
+                );
+                sum += probability;
+            }
+            prop_assert!(
+                (sum - 1.0).abs() < 1e-3,
+                "probabilities summed to {sum}, expected ~1.0, state={state:?}"
+            );
+
+            prop_assert!(
+                prediction.confidence.is_finite(),
+                "non-finite confidence {}, state={state:?}",
+                prediction.confidence
+            );
+            prop_assert!(
+                (-1e-4..=1.0 + 1e-4).contains(&prediction.confidence),
+                "confidence {} out of [0,1], state={state:?}",
+                prediction.confidence
+            );
+
+            let selected_probability = prediction
+                .probabilities
+                .iter()
+                .find(|(intent, _)| *intent == prediction.intent)
+                .map(|(_, probability)| *probability)
+                .expect("selected intent must appear in probabilities");
+            prop_assert!(
+                (selected_probability - prediction.confidence).abs() < 1e-3,
+                "confidence {} doesn't match selected intent {:?}'s own probability {selected_probability}, state={state:?}",
+                prediction.confidence,
+                prediction.intent
+            );
+
+            let max_probability = prediction
+                .probabilities
+                .iter()
+                .map(|(_, probability)| *probability)
+                .fold(f32::MIN, f32::max);
+            prop_assert!(
+                selected_probability >= max_probability - 1e-4,
+                "selected intent {:?} (probability {selected_probability}) is not the argmax \
+                (max was {max_probability}), state={state:?}",
+                prediction.intent
+            );
+
+            prop_assert!(
+                !prediction.evidence.is_empty(),
+                "evidence must never be empty, state={state:?}"
+            );
+        }
+
+        /// `agent_active` must always win regardless of what else is set —
+        /// the gate exists specifically so a strongly-Debugging-shaped
+        /// state can't leak through it.
+        #[test]
+        fn agent_active_always_wins_at_full_confidence(
+            state in session_state_strategy(),
+            last_edit_magnitude in last_edit_magnitude_strategy(),
+        ) {
+            let mut state = state;
+            state.agent_active = true;
+            let prediction = classify(&state, last_edit_magnitude);
+            prop_assert_eq!(prediction.intent, DeveloperIntent::ConsultingAgent);
+            prop_assert!((prediction.confidence - 1.0).abs() < 1e-6);
+        }
+
+        /// `classify` takes `&SessionState` — calling it twice with an
+        /// identical state must be deterministic (same intent/confidence/
+        /// probabilities), even though each call mints a fresh
+        /// `PredictionId`. Guards against any accidental reliance on hidden
+        /// global/time-based state inside the scoring math itself.
+        #[test]
+        fn classify_is_deterministic_for_identical_input(
+            state in session_state_strategy(),
+            last_edit_magnitude in last_edit_magnitude_strategy(),
+        ) {
+            let first = classify(&state, last_edit_magnitude);
+            let second = classify(&state, last_edit_magnitude);
+            prop_assert_eq!(first.intent, second.intent);
+            prop_assert!((first.confidence - second.confidence).abs() < 1e-9);
+            prop_assert_eq!(first.probabilities, second.probabilities);
+        }
     }
 }

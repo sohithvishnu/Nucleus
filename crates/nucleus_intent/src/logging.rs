@@ -33,8 +33,8 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_QUEUE_LEN: usize = 50;
 
 /// One JSON object per observed edit/save/task-run/file-switch/selection
-/// change. Never carries source code text or diffs — only paths, symbol
-/// names, and size counts.
+/// change/plain-terminal command. Never carries source code text or diffs —
+/// only paths, symbol names, size counts, and (redacted) command strings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RawEvent {
@@ -61,6 +61,20 @@ pub enum RawEvent {
     },
     TaskFailed {
         label: Option<String>,
+    },
+    /// Phase 4b-1: a command started in a plain (non-task) terminal, detected
+    /// via injected shell hooks — see `terminal_watcher`. `command` has
+    /// already been through `terminal_watcher::redact_command` by the time
+    /// it reaches here.
+    TerminalCommandStarted {
+        command: String,
+    },
+    /// Phase 4b-1: the matching finish for a `TerminalCommandStarted` in the
+    /// same terminal. `command` is redacted the same way.
+    TerminalCommandFinished {
+        command: String,
+        exit_code: i32,
+        duration_ms: u64,
     },
 }
 

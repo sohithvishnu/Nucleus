@@ -267,6 +267,9 @@ pub struct SettingsContent {
     /// Configuration of the terminal in Zed.
     pub terminal: Option<TerminalSettingsContent>,
 
+    /// Settings for Nucleus's plain-terminal command detection (phase 4b-1).
+    pub nucleus_terminal_watcher: Option<NucleusTerminalWatcherSettingsContent>,
+
     pub title_bar: Option<TitleBarSettingsContent>,
 
     /// Whether or not to enable Vim mode.
@@ -651,6 +654,20 @@ pub enum DockPosition {
     Left,
     Bottom,
     Right,
+}
+
+/// Configuration of Nucleus's plain-terminal command detection (phase 4b-1):
+/// injects `precmd`/`preexec`-equivalent shell hooks to observe command
+/// start/finish in non-task terminals. Observation only — not fed into
+/// intent classification yet.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct NucleusTerminalWatcherSettingsContent {
+    /// Whether to inject shell hooks to detect plain-terminal command
+    /// start/finish.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 /// Configuration of voice calls in Zed.

@@ -713,6 +713,20 @@ fn summarize_log_entry(entry: &LogEntry) -> (&'static str, String, Color) {
                 RawEvent::TaskFailed { label } => {
                     format!("task failed: {}", label_or_dash(label))
                 }
+                RawEvent::TerminalCommandStarted { command } => {
+                    let category = nucleus_intent::categorize_command(command).label();
+                    format!("terminal command started ({category}): {command}")
+                }
+                RawEvent::TerminalCommandFinished {
+                    command,
+                    exit_code,
+                    duration_ms,
+                } => {
+                    let category = nucleus_intent::categorize_command(command).label();
+                    format!(
+                        "terminal command finished ({category}, exit {exit_code}, {duration_ms}ms): {command}"
+                    )
+                }
             };
             ("event", summary, Color::Muted)
         }

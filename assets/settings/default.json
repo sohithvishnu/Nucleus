@@ -526,6 +526,11 @@
     "space": "•",
     "tab": "→",
   },
+  // Settings for Nucleus's plain-terminal command detection (phase 4b-1)
+  "nucleus_terminal_watcher": {
+    // Inject shell hooks to detect plain-terminal command start/finish
+    "enabled": true,
+  },
   // Settings related to calls in Zed
   "calls": {
     // Join calls with the microphone live by default

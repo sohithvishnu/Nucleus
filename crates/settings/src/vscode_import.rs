@@ -200,6 +200,7 @@ impl VsCodeSettings {
             line_indicator_format: None,
             log: None,
             node: self.node_binary_settings(),
+            nucleus_terminal_watcher: None,
 
             outline_panel: self.outline_panel_settings_content(),
             preview_tabs: self.preview_tabs_settings_content(),
