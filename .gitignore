@@ -8,6 +8,7 @@
 *.wasm
 *.xcodeproj
 .DS_Store
+._*
 .blob_store
 .build
 .claude/settings.local.json
