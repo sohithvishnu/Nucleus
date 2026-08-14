@@ -61,7 +61,7 @@ they're "always scored 0, never actually predicted."
 
 **Weighted signals**, now six categories instead of three:
 
-Debugging (unchanged from original audit):
+Debugging (original signals + terminal-engagement session's rule 1):
 | Signal | Weight |
 |---|---|
 | `failed_test_runs > 0` | `0.35 + 0.03 × (min(failed_test_runs,5) - 1)` |
@@ -70,32 +70,39 @@ Debugging (unchanged from original audit):
 | last edit magnitude < 10 chars | `0.10` |
 | pause in `[30s, 300s]` | `0.15 × (1 - position)`, linearly decaying |
 | `cursor_at_diagnostic` | `0.30` |
-| `focused_pane == Terminal` | `0.08` |
+| **focused terminal's last command failed (any category)** | `0.20 + 0.06 × (min(terminal_activity_events, 8.0) - 2.0)`, gated on `terminal_activity_events ≥ 2.0` |
 
-Implementing (original signals + one new one):
+`focused_pane == Terminal`'s old flat `0.08` is **gone** — see "Terminal-engagement
+session" below.
+
+Implementing (original signals only — no new terminal-engagement signal was added
+here; see below for why):
 | Signal | Weight |
 |---|---|
 | 0 diagnostics errors AND ≥1 save | `0.25` |
 | ≥2 file switches | `0.06 × min(file_switches, 5)` |
 | last edit magnitude ≥ 40 chars | `0.25`, plus `0.15 × (min(large_edits,4) - 1)` if ≥2 recurring large edits within a 30s burst window |
-| **decayed `edit_events` ≥ 2.0** (new) | `0.30 + 0.06 × (min(edit_events, 8.0) - 2.0)` |
+| decayed `edit_events` ≥ 2.0 | `0.30 + 0.06 × (min(edit_events, 8.0) - 2.0)` |
 | passing test/task runs (>0, 0 failed) | `0.15` |
 | pause < 10s | `0.10` |
-| `focused_pane == Editor` | `0.08` |
 
-Testing (new):
+`focused_pane == Editor`'s old flat `0.08` is also gone, same reason.
+
+Testing (original signals + terminal-engagement session's rule 2):
 | Signal | Weight |
 |---|---|
 | `test_command_running` | `0.55` |
 | `test_command_recently_passed` | `0.45` |
+| **focused terminal's last command was `Test`-category (pass or fail)** | `0.20 + 0.06 × (min(terminal_activity_events, 8.0) - 2.0)`, same gate as Debugging's rule above |
 
-Exploring (new):
+Exploring (original signal + terminal-engagement session's rule 3):
 | Signal | Weight |
 |---|---|
 | decayed `navigation_events` ≥ 2.0 AND decayed `edit_events` ≤ 1.5 | `0.45 + 0.05 × (min(navigation_events, 8.0) - 2.0)` |
 | pause < 10s | `0.10` |
+| **focused terminal's last command succeeded and wasn't a test** | `0.25 + 0.06 × (min(terminal_activity_events, 8.0) - 2.0)`, same gate as above |
 
-Configuring (new):
+Configuring (unchanged):
 | Signal | Weight |
 |---|---|
 | decayed `edit_events > 0.0` AND active file is a recognized config file | `0.55` (flat, not scaled) |
@@ -120,19 +127,75 @@ best only on a strict win, which reproduces the original three-way tie-break exa
 categories a documented slot (see the priority-order comment at `nucleus.rs:1786+`
 for the reasoning behind that specific order).
 
-**Part C signals** (`focused_pane`, `cursor_at_diagnostic`) remain small
-priors/correlations folded into the weighted scoring, not gates — unchanged.
+**`cursor_at_diagnostic`** remains a small correlation signal folded into Debugging's
+weighted scoring, not a gate — unchanged. **`focused_pane`** is no longer a weighted
+signal at all as of the terminal-engagement session — see below.
+
+## Terminal-engagement session
+
+Motivated by a real logged prediction: `Idle 92% — terminal currently focused (not
+enough alone to indicate active work)`. Correctly downweighted alone, but the real
+problem was `focused_pane` being the *only* thing the classifier knew about terminal
+activity — no equivalent of the editor's edit-density/navigation-density existed for
+terminal engagement (selecting/scrolling output), so actively reading a stack trace
+in the terminal could register as nothing.
+
+**Part A — new signal**: `RecentActions::terminal_activity_events`, a third decayed
+density (same `decayed_density`/`DENSITY_DECAY_TIME_CONSTANT_SECS` machinery as
+`edit_events`/`navigation_events`), fed by `terminal::Event::SelectionsChanged` on
+every plain terminal (`NucleusEngine` now holds a `terminal_subscriptions:
+HashMap<EntityId, Subscription>`, subscribed once per terminal in
+`poll_plain_terminals`, pruned alongside `terminal_watcher`'s own per-terminal state).
+Deliberately covers selection only, not pure scrolling — no low-noise dedicated event
+exists for scroll-without-select in this terminal stack, and reusing `Event::Wakeup`
+would be far too noisy (fires for reasons unrelated to engagement, like output
+arriving or cursor blink).
+
+New `SessionState` field `focused_terminal_last_command: Option<LastCommandOutcome>`
+(`LastCommandOutcome { category: CommandCategory, exit_code: i32 }`, new in
+`terminal_watcher.rs`) — the *focused* terminal's most recently completed command,
+tracked via a new `TerminalCommandWatcher::last_completed` map, populated in
+`scan_lines` and exposed via `last_completed_command(terminal_id)`.
+`NucleusEngine::compute_focused_pane` now also returns the focused terminal's
+`EntityId` (when applicable) so `prune_and_refresh` can look this up.
+
+`terminal_engagement(state)` gates `focused_terminal_last_command` behind
+`terminal_activity_events ≥ MIN_TERMINAL_ACTIVITY_FOR_SIGNAL` (2.0, same threshold
+shape as the other two density signals) and routes the `Some` case three ways —
+see the updated Debugging/Testing/Exploring tables above. Rules 1 ("failed, any
+category" → Debugging) and 2 ("Test-category, regardless of pass/fail" → Testing)
+are deliberately **not** mutually exclusive: a failed test satisfies both at once and
+scores both categories, the same way task-runner and plain-terminal test signals
+were already allowed to coexist without one diluting the other. Rule 4 (no completed
+command yet) contributes nothing — not even to Idle's floor, since the selection
+activity that would trigger this already resets `pause_seconds` independently, same
+as every other activity signal in this file.
+
+**Part B — pane focus demoted to a tiebreaker**: `WEIGHT_TERMINAL_FOCUS`/
+`WEIGHT_EDITOR_FOCUS` (the old flat `+0.08` contributions) are gone entirely.
+`apply_focus_tiebreaker` runs once, after the normal priority-order winner selection,
+and only ever swaps the winner for the focused pane's associated intent
+(`Debugging` for `Terminal`, `Implementing` for `Editor`) when that intent is the
+*true* runner-up and within `FOCUS_TIE_MARGIN` (0.05, five percentage points) of the
+winner. A swap updates both entries in `probabilities` (not just the headline
+`intent`/`confidence`), which is required for `classify`'s own contract (selected
+intent's confidence must equal its own `probabilities` entry, and be the argmax) to
+keep holding after the swap — confirmed by the `classify_never_violates_its_own_contract`
+proptest, which caught two real bugs during this session before landing (a
+tie-break-order mismatch between a naive re-sort and `classify`'s own documented
+priority order, and an under-normalized confidence value after a swap).
 
 ## SessionState fields: fed into scoring vs. tracked-only
 
 | Field | Fed into `classify`? | Notes |
 |---|---|---|
 | `recent_actions.{test_runs,failed_test_runs,saves,file_switches,large_edits}` | Yes | Unchanged direct signal inputs. |
-| `recent_actions.{edit_events,navigation_events}` | **Yes — new** | Now `f32` decayed densities (were `u32` hard-window counts in an interim revision of the classifier-expansion session, then reworked to decay before landing). Feed Implementing/Exploring/Configuring. |
+| `recent_actions.{edit_events,navigation_events,terminal_activity_events}` | **Yes** | `f32` decayed densities. `terminal_activity_events` is new this session, feeding Debugging/Testing/Exploring via `terminal_engagement`. |
+| `focused_terminal_last_command` | **Yes — new** | The focused terminal's most recently completed command (category + exit code); `None` gates the terminal-engagement signal off entirely. |
 | `diagnostics.{errors,warnings}` | Partially | Unchanged: `errors` feeds Debugging/Implementing; `warnings` still tracked/displayed only, never read inside `classify`. |
 | `pause_seconds` | Yes | Unchanged: Debugging's pause weight, Idle's floor, and now also Implementing's/Exploring's "continuous activity" bonuses. |
 | `agent_active` | Yes | The hard gate, unchanged. |
-| `focused_pane` | Yes | Unchanged small Debugging/Implementing priors. |
+| `focused_pane` | **Changed** | No longer a weighted score input — a context selector (gates `focused_terminal_last_command`'s computation) and, via `apply_focus_tiebreaker`, a tiebreaker only. |
 | `cursor_at_diagnostic` | Yes | Unchanged Debugging signal. |
 | `test_command_running` / `test_command_recently_passed` | **Yes — new** | Testing's only inputs. |
 | `active_files` | **Yes — changed.** The original audit said "No" (tracked/displayed only). That's now wrong: `active_files.first()` is read by Configuring's file-identity check. |
@@ -248,27 +311,35 @@ same `RawEvent` variant set including the Phase 4b-1 `TerminalCommandStarted`/
 
 ## Test coverage
 
-`cargo test -p nucleus_intent --lib`: **78 passed; 0 failed; 0 ignored** (run this
-session). Breakdown by module:
+`cargo test -p nucleus_intent --lib`: **93 passed; 0 failed; 0 ignored** (run this
+session — up from 84 immediately before the terminal-engagement session's 9 new
+tests landed; the doc's previous "78" snapshot predates even that). Breakdown by
+module:
 
 | Module | Count | What it covers |
 |---|---|---|
-| `tests` | 32 | `classify()` scoring (original regression suite + classifier-expansion additions: edit-density, navigation-density/Exploring, Testing in-flight/recently-passed/failed-test boundary, Configuring positive/negative/`.env`-family, `decayed_density` itself), plus the real-file logger/feedback round-trip tests. |
+| `tests` | 41 | `classify()` scoring (original regression suite + classifier-expansion additions + terminal-engagement session's 9 new tests: the three routing rules, the no-completed-command/below-threshold cases, the failed-test double-count, and three tiebreaker tests — exact tie, clear-leader-never-overridden, margin boundary), plus the real-file logger/feedback round-trip tests. |
 | `terminal_watcher::tests` | 32 | Hook script content, install-command shape, redaction, categorization, marker parsing, injection-state bookkeeping, the bash `DEBUG`-trap fix, `has_pending_command_of_category`. |
 | `terminal_watcher::stress_tests` | 11 | `proptest`-based fuzzing of redaction/categorization/marker-parsing/hook-install-command against arbitrary input. |
-| `classify_stress_tests` | 3 | `proptest`-based fuzzing of `classify()` itself — including `edit_events`/`navigation_events` now generated as *full-range `f32`*, deliberately including NaN/Infinity/negative values a real engine could never produce, to stress-test that every use of those fields (all comparison-gated) degrades safely rather than propagating a non-finite value into the output. |
+| `classify_stress_tests` | 3 | `proptest`-based fuzzing of `classify()` itself — including `edit_events`/`navigation_events`/`terminal_activity_events` (all three, since this session) generated as *full-range `f32`*, deliberately including NaN/Infinity/negative values a real engine could never produce, plus `focused_terminal_last_command` fuzzed independently (`None`/`Some` with arbitrary category+exit code) — to stress-test that every use of those fields degrades safely. Also re-run this session at `PROPTEST_CASES=5000` (25× the default) with no failures, on top of the default-count run. |
 
-`cargo test -p sqlez --lib`: **21 passed, 0 failed**.
+`cargo test -p sqlez --lib`: **21 passed, 0 failed** (unchanged, not touched this
+session).
 
-Regression scenarios explicitly re-verified this session (not just re-run — checked
-their actual numeric output): pause-alone still resolves to Idle at low Debugging
-confidence, sustained-edit-burst still resolves to Implementing, stale-signal-long-
-pause still resolves to Idle, diagnostic-location-correlation still shows a
-meaningful (>0.1) jump, pane-focus-alone still stays under 0.2 confidence for both
-Debugging and Implementing, and the agent-gate override still zeroes every other
-probability. None of their numeric values shifted from before the classifier-expansion
-work landed — the six new/changed fields all default to `0.0`/`false` for every
-pre-existing test scenario.
+Regression scenarios explicitly re-verified this session under the *new* tiebreaker
+model (not just re-run — checked their actual numeric output and, for the
+pane-focus-alone scenario specifically, re-confirmed the *reasoning* still holds, not
+just the pass/fail): pause-alone still resolves to Idle at low Debugging confidence,
+sustained-edit-burst still resolves to Implementing, stale-signal-long-pause still
+resolves to Idle, diagnostic-location-correlation still shows a meaningful (>0.1)
+jump, pane-focus-alone still stays under 0.2 confidence for both Debugging and
+Implementing (now via a *stronger* mechanism than before — no flat contribution
+fires at all, and the tiebreaker's own margin check, `1.0 - 0.0 = 1.0 > 0.05`,
+confirms it can't spuriously promote either category off a bare 0 vs. 1.0 gap), and
+the agent-gate override still zeroes every other probability. None of their numeric
+values shifted from before this session's work landed — every new/changed field
+still defaults to `0.0`/`None`/`false` for every pre-existing test scenario, and the
+two old flat pane-focus weights they never depended on are simply gone.
 
 ## Debug/log-viewer UI (`engine_panel`)
 
@@ -296,8 +367,15 @@ Confirmed by reading `engine_panel.rs` and `log_view.rs` directly this session:
   (via categorization), not by fixing the underlying task-runner conflation.
 - `cursor_at_diagnostic` is still a point-in-time check with no dwell tracking —
   unchanged, still an accepted first pass per its own doc comment.
-- Window-scoped signals (`agent_active`, `focused_pane`, `cursor_at_diagnostic`) still
-  only refresh on the `PRUNE_INTERVAL` tick (10s) — unchanged.
+- Window-scoped signals (`agent_active`, `focused_pane`, `cursor_at_diagnostic`, and
+  now `focused_terminal_last_command`) still only refresh on the `PRUNE_INTERVAL`
+  tick (10s) — unchanged, extended to the new field for the same reason
+  (`compute_focused_pane` needs a `Window`).
+- `terminal_activity_events` only tracks *selection* activity, not pure scrolling —
+  no low-noise dedicated event exists for scroll-without-select in this terminal
+  stack, and `Event::Wakeup` is too noisy to reuse (fires for reasons unrelated to
+  engagement). A real limitation if a user reads terminal output purely by scroll
+  wheel without ever dragging to select — not addressed this session.
 - No retention policy for `~/.nucleus/logs/*.jsonl` — unchanged, still explicitly out
   of scope per `logging.rs`'s module doc comment.
 - **No OSC 133 support** — still true; re-confirmed via `grep -rn osc_dispatch`
@@ -307,8 +385,10 @@ Confirmed by reading `engine_panel.rs` and `log_view.rs` directly this session:
   (Phase 4b-1) — see the original audit's own claim about this in Discrepancies
   below.
 - All weight constants are still explicitly documented as first-pass guesses, "not
-  tuned against real usage yet" — now including the new Part A-D weights and the
-  15-second density-decay time constant.
+  tuned against real usage yet" — now including the new Part A-D weights, the
+  15-second density-decay time constant, the terminal-engagement weights
+  (`WEIGHT_TERMINAL_ENGAGEMENT_{FAILED,TEST,EXPLORING}`, all reasoned relative to
+  existing weights but not tuned against real usage), and `FOCUS_TIE_MARGIN` (0.05).
 - A classifier-expansion session (Part E) cross-checked the taxonomy and idle-floor
   curve against WakaTime/ActivityWatch and left `docs/PHASE6_INTERRUPTION_NOTES.md`
   as a landing pad for future interruption-policy work — validation only, nothing

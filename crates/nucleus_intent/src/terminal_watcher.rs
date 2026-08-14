@@ -32,8 +32,11 @@
 //!
 //! Deliberately narrow (4b-1 of a 3-part plan): detects and logs command
 //! start/finish only. Feeds `DeveloperIntent::Testing` (the
-//! classifier-expansion session's Part B) via command categorization below;
-//! nothing else in `classify()` reads from here.
+//! classifier-expansion session's Part B) via command categorization below,
+//! and — since the terminal-engagement session — also `Debugging`/
+//! `Exploring` via [`TerminalCommandWatcher::last_completed_command`], the
+//! most recently completed command's category and exit code for a specific
+//! terminal (see `nucleus::classify`'s doc comment for how that's routed).
 //!
 //! ## Marker anti-collision, mirroring the existing init-command marker
 //!
@@ -57,6 +60,7 @@ use base64::Engine as _;
 use collections::{HashMap, HashSet};
 use gpui::EntityId;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -316,9 +320,12 @@ pub fn parse_end_marker(line: &str) -> Option<i32> {
     payload.parse::<i32>().ok()
 }
 
-/// Coarse, non-authoritative bucket for a detected command — observational
-/// only this session, not fed into `classify()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Coarse, non-authoritative bucket for a detected command. Fed into
+/// `classify()` two ways: `has_pending_command_of_category` (in-flight,
+/// `DeveloperIntent::Testing`) and, since the terminal-engagement session,
+/// [`LastCommandOutcome::category`] (most recently *completed* command,
+/// `DeveloperIntent::Debugging`/`Testing`/`Exploring`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandCategory {
     Test,
     Build,
@@ -413,10 +420,7 @@ static REDACTION_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(
             Regex::new(r#"(?i)(Authorization:\s*Bearer\s+)[^\s'"]+"#).unwrap(),
             "${1}[REDACTED]",
         ),
-        (
-            Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
-            "[REDACTED]",
-        ),
+        (Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(), "[REDACTED]"),
         (
             Regex::new(r"(?i)\b((?:key|secret|pass)=)[A-Za-z0-9+/_.\-]{8,}\b").unwrap(),
             "${1}[REDACTED]",
@@ -454,6 +458,17 @@ pub enum TerminalCommandOutcome {
     },
 }
 
+/// A completed command's category and exit code — deliberately small (no
+/// command text, no timestamp): this exists to answer exactly one question
+/// for `nucleus::classify`'s terminal-engagement signal, "how did the most
+/// recent command in this terminal turn out," not to duplicate the fuller
+/// `TerminalCommandOutcome::Finished` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastCommandOutcome {
+    pub category: CommandCategory,
+    pub exit_code: i32,
+}
+
 /// Read-side state for a single terminal's marker file: where it is, and
 /// how many bytes of it have already been consumed.
 struct MarkerFileReader {
@@ -474,6 +489,12 @@ pub struct TerminalCommandWatcher {
     /// Where each injected terminal's markers land, and how much of that
     /// file has already been read — see `set_marker_file`/`poll_marker_file`.
     marker_files: HashMap<EntityId, MarkerFileReader>,
+    /// The most recently *completed* command's category and exit code, per
+    /// terminal — separate from `pending` above (which only tracks a
+    /// command currently in flight). Only ever holds the single latest
+    /// outcome per terminal; an earlier one is overwritten, never
+    /// accumulated. See `last_completed_command`.
+    last_completed: HashMap<EntityId, LastCommandOutcome>,
 }
 
 impl TerminalCommandWatcher {
@@ -503,14 +524,16 @@ impl TerminalCommandWatcher {
     }
 
     /// Drops state for terminals that no longer exist, so `injected`/
-    /// `observed`/`pending`/`marker_files` don't grow unboundedly across a
-    /// long session of opening and closing terminals — and best-effort
-    /// deletes each dropped terminal's now-unneeded marker file from disk,
-    /// so those don't accumulate either.
+    /// `observed`/`pending`/`marker_files`/`last_completed` don't grow
+    /// unboundedly across a long session of opening and closing terminals —
+    /// and best-effort deletes each dropped terminal's now-unneeded marker
+    /// file from disk, so those don't accumulate either.
     pub fn prune(&mut self, live_terminal_ids: &HashSet<EntityId>) {
         self.injected.retain(|id| live_terminal_ids.contains(id));
         self.observed.retain(|id| live_terminal_ids.contains(id));
         self.pending.retain(|id, _| live_terminal_ids.contains(id));
+        self.last_completed
+            .retain(|id, _| live_terminal_ids.contains(id));
         self.marker_files.retain(|id, reader| {
             let keep = live_terminal_ids.contains(id);
             if !keep && let Err(error) = std::fs::remove_file(&reader.path) {
@@ -524,8 +547,13 @@ impl TerminalCommandWatcher {
     /// `poll_marker_file` knows what to read. Called once per terminal, at
     /// injection time, alongside `mark_injected`.
     pub fn set_marker_file(&mut self, terminal_id: EntityId, path: PathBuf) {
-        self.marker_files
-            .insert(terminal_id, MarkerFileReader { path, bytes_read: 0 });
+        self.marker_files.insert(
+            terminal_id,
+            MarkerFileReader {
+                path,
+                bytes_read: 0,
+            },
+        );
     }
 
     /// Reads whatever *complete* lines have been appended to `terminal_id`'s
@@ -622,6 +650,13 @@ impl TerminalCommandWatcher {
             if let Some(exit_code) = parse_end_marker(line)
                 && let Some(pending) = self.pending.remove(&terminal_id)
             {
+                self.last_completed.insert(
+                    terminal_id,
+                    LastCommandOutcome {
+                        category: categorize_command(&pending.command),
+                        exit_code,
+                    },
+                );
                 outcomes.push(TerminalCommandOutcome::Finished {
                     command: pending.command,
                     exit_code,
@@ -630,6 +665,17 @@ impl TerminalCommandWatcher {
             }
         }
         outcomes
+    }
+
+    /// The most recently completed command's category and exit code for
+    /// `terminal_id`, if any command has finished in it yet — `None` for a
+    /// freshly-opened terminal (or one that's never had a command finish).
+    /// Used by `NucleusEngine` to feed `SessionState::
+    /// focused_terminal_last_command`, which `nucleus::classify`'s
+    /// terminal-engagement signal routes by (see that function's doc
+    /// comment).
+    pub fn last_completed_command(&self, terminal_id: EntityId) -> Option<LastCommandOutcome> {
+        self.last_completed.get(&terminal_id).copied()
     }
 }
 
@@ -654,10 +700,7 @@ mod tests {
     #[test]
     fn test_redact_authorization_bearer() {
         let redacted = redact_command("curl -H 'Authorization: Bearer sk-abc123def456'");
-        assert_eq!(
-            redacted,
-            "curl -H 'Authorization: Bearer [REDACTED]'"
-        );
+        assert_eq!(redacted, "curl -H 'Authorization: Bearer [REDACTED]'");
     }
 
     #[test]
@@ -693,7 +736,10 @@ mod tests {
     #[test]
     fn test_categorize_git() {
         assert_eq!(categorize_command("git status"), CommandCategory::Git);
-        assert_eq!(categorize_command("git commit -am wip"), CommandCategory::Git);
+        assert_eq!(
+            categorize_command("git commit -am wip"),
+            CommandCategory::Git
+        );
     }
 
     #[test]
@@ -710,7 +756,10 @@ mod tests {
     #[test]
     fn test_categorize_build_commands() {
         assert_eq!(categorize_command("make"), CommandCategory::Build);
-        assert_eq!(categorize_command("cargo build --release"), CommandCategory::Build);
+        assert_eq!(
+            categorize_command("cargo build --release"),
+            CommandCategory::Build
+        );
         assert_eq!(categorize_command("npm run build"), CommandCategory::Build);
     }
 
@@ -722,9 +771,18 @@ mod tests {
 
     #[test]
     fn test_categorize_package_commands() {
-        assert_eq!(categorize_command("npm install lodash"), CommandCategory::Package);
-        assert_eq!(categorize_command("pip install requests"), CommandCategory::Package);
-        assert_eq!(categorize_command("cargo add serde"), CommandCategory::Package);
+        assert_eq!(
+            categorize_command("npm install lodash"),
+            CommandCategory::Package
+        );
+        assert_eq!(
+            categorize_command("pip install requests"),
+            CommandCategory::Package
+        );
+        assert_eq!(
+            categorize_command("cargo add serde"),
+            CommandCategory::Package
+        );
     }
 
     #[test]
@@ -1005,7 +1063,10 @@ mod tests {
         append_to(&path, "\n");
         let outcomes = watcher.poll_marker_file(terminal_id);
         assert_eq!(outcomes.len(), 1);
-        assert!(matches!(&outcomes[0], TerminalCommandOutcome::Started { .. }));
+        assert!(matches!(
+            &outcomes[0],
+            TerminalCommandOutcome::Started { .. }
+        ));
 
         std::fs::remove_file(&path).ok();
     }
@@ -1078,8 +1139,16 @@ mod tests {
         let marker_path = std::path::Path::new("/tmp/nucleus_markers_test.log");
         let input = hook_install_command(ShellKind::Posix, path, marker_path);
         let text = String::from_utf8(input).expect("install command must be valid UTF-8");
-        assert_eq!(text.matches('\n').count(), 0, "must be a single line: {text:?}");
-        assert_eq!(text.matches('\r').count(), 1, "must end in exactly one CR: {text:?}");
+        assert_eq!(
+            text.matches('\n').count(),
+            0,
+            "must be a single line: {text:?}"
+        );
+        assert_eq!(
+            text.matches('\r').count(),
+            1,
+            "must end in exactly one CR: {text:?}"
+        );
         assert!(text.starts_with("__nucleus_hook_path='/tmp/nucleus_hook_test.sh'"));
         assert!(text.contains(". '/tmp/nucleus_hook_test.sh'"));
         assert!(text.contains("__nucleus_marker_file='/tmp/nucleus_markers_test.log'"));
@@ -1098,7 +1167,11 @@ mod tests {
         let text = String::from_utf8(input).expect("install command must be valid UTF-8");
         assert!(text.starts_with("set -g __nucleus_marker_file '/tmp/nucleus_markers_test.log'"));
         assert!(text.contains("source '/tmp/nucleus_hook_test.sh'"));
-        assert_eq!(text.matches('\n').count(), 0, "must be a single line: {text:?}");
+        assert_eq!(
+            text.matches('\n').count(),
+            0,
+            "must be a single line: {text:?}"
+        );
         assert!(
             text.contains("clear"),
             "must clear the screen so the install line's own echo doesn't linger: {text:?}"

@@ -319,7 +319,10 @@ pub fn parse_log_line(line: &str) -> Option<LogEntry> {
             // Feedback::deserialize simply ignores the keys it doesn't
             // recognize.
             let feedback = serde_json::from_value(value).ok()?;
-            Some(LogEntry::Feedback { timestamp, feedback })
+            Some(LogEntry::Feedback {
+                timestamp,
+                feedback,
+            })
         }
         _ => None,
     }

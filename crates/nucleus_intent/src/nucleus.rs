@@ -37,7 +37,7 @@ pub use logging::{
     Feedback, LogEntry, MAX_HISTORY_LINES, NucleusLogger, RawEvent, list_log_dates, log_dir,
     parse_log_line, read_log_file,
 };
-pub use terminal_watcher::{CommandCategory, categorize_command};
+pub use terminal_watcher::{CommandCategory, LastCommandOutcome, categorize_command};
 pub use terminal_watcher_settings::NucleusTerminalWatcherSettings;
 
 /// How far back "recent" activity counters look before decaying away.
@@ -253,6 +253,21 @@ pub struct RecentActions {
     /// between definitions) from both Implementing and Idle.
     #[serde(default)]
     pub navigation_events: f32,
+    /// Terminal-engagement session: recency-and-frequency-decayed sum of
+    /// selection-changed events in a terminal pane — the terminal
+    /// equivalent of `navigation_events` above, fed by
+    /// `terminal::Event::SelectionsChanged` on every plain (non-task)
+    /// terminal, not scoped to whichever one is currently focused (same
+    /// choice already made for `edit_events`/`navigation_events`, neither
+    /// of which is scoped to a single file either). `classify` only ever
+    /// treats this as engagement while a terminal pane is actually focused
+    /// (`SessionState::focused_pane`), so an unfocused terminal's own
+    /// scrollback selection can't leak into scoring for whichever pane
+    /// currently has focus. Only meaningful together with
+    /// `SessionState::focused_terminal_last_command` — see `classify`'s
+    /// doc comment for how the two combine.
+    #[serde(default)]
+    pub terminal_activity_events: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,8 +302,14 @@ pub struct SessionState {
     /// weighted signal. See `classify`'s doc comment.
     #[serde(default)]
     pub agent_active: bool,
-    /// Part C: mild prior toward Debugging (terminal) or Implementing
-    /// (editor) — see `classify`.
+    /// Part C, revised by the terminal-engagement session: **not** a direct
+    /// scoring input anymore. Originally a flat prior added straight to
+    /// Debugging's (terminal) or Implementing's (editor) score regardless
+    /// of how the rest of scoring looked; now purely a *context selector* —
+    /// it decides which content-aware engagement signals are relevant
+    /// (e.g. gating the terminal-engagement signal below), and otherwise
+    /// only breaks a genuine near-tie between two already-close candidates.
+    /// See `classify`'s doc comment for the full reframe and reasoning.
     #[serde(default)]
     pub focused_pane: FocusedPane,
     /// Part C: whether the cursor is currently at or within
@@ -313,6 +334,16 @@ pub struct SessionState {
     /// complete, not a stale one from minutes ago.
     #[serde(default)]
     pub test_command_recently_passed: bool,
+    /// Terminal-engagement session: the most recently *completed*
+    /// command's category and exit code in the currently-*focused*
+    /// terminal pane specifically — `None` whenever no terminal is focused
+    /// at all, or the focused terminal hasn't had a command finish in it
+    /// yet (a freshly opened terminal, or one that's only had a command
+    /// start so far). Together with `recent_actions.
+    /// terminal_activity_events`, this is what routes terminal engagement
+    /// into Debugging/Testing/Exploring — see `classify`'s doc comment.
+    #[serde(default)]
+    pub focused_terminal_last_command: Option<LastCommandOutcome>,
 }
 
 /// Stable per-prediction identifier so a feedback response (Part A) can
@@ -400,6 +431,21 @@ pub struct NucleusEngine {
     /// Backs `RecentActions::navigation_events` (Part A #2) — same
     /// decay-at-`refresh`-time treatment as `edit_timestamps` above.
     selection_timestamps: VecDeque<Instant>,
+    /// Backs `RecentActions::terminal_activity_events` (terminal-engagement
+    /// session) — same decay-at-`refresh`-time treatment as
+    /// `selection_timestamps` above, fed by every plain terminal's
+    /// `terminal::Event::SelectionsChanged` (see `terminal_subscriptions`).
+    terminal_selection_timestamps: VecDeque<Instant>,
+    /// Live subscriptions to each plain terminal's `terminal::Event`, keyed
+    /// by `EntityId` so `poll_plain_terminals` only subscribes once per
+    /// terminal rather than accumulating a duplicate subscription on every
+    /// poll tick — the terminal analog of `sync_active_item`'s editor
+    /// subscription, except there can be several live terminals at once
+    /// instead of one active editor, so this needs its own per-entity
+    /// bookkeeping rather than a single `Vec` cleared and rebuilt on
+    /// switch. Pruned alongside `terminal_watcher`'s own per-terminal
+    /// state in `poll_plain_terminals`.
+    terminal_subscriptions: HashMap<EntityId, Subscription>,
     /// Backs `SessionState::test_command_recently_passed` (Part B) —
     /// timestamps of `test`-category plain-terminal commands that finished
     /// with exit code 0. Whether one is *currently* running is queried
@@ -526,6 +572,8 @@ impl NucleusEngine {
             large_edit_timestamps: VecDeque::new(),
             edit_timestamps: VecDeque::new(),
             selection_timestamps: VecDeque::new(),
+            terminal_selection_timestamps: VecDeque::new(),
+            terminal_subscriptions: HashMap::default(),
             test_pass_timestamps: VecDeque::new(),
             last_activity_at: Instant::now(),
             workspace: weak_workspace,
@@ -820,6 +868,15 @@ impl NucleusEngine {
     /// to a dedicated file — see `terminal_watcher`'s module doc comment for
     /// why), the same tradeoff already accepted for task-terminal detection.
     ///
+    /// Also (terminal-engagement session) subscribes to every live plain
+    /// terminal's `terminal::Event::SelectionsChanged`, once per terminal
+    /// (`terminal_subscriptions` tracks which ones already have a live
+    /// subscription so this doesn't accumulate duplicates on every poll
+    /// tick) — unlike command-marker detection, plain GPUI events are the
+    /// right tool here (no OSC/visibility problem to sidestep; a selection
+    /// change is a normal, directly observable UI event, not terminal
+    /// *content* this crate would otherwise have to scan for).
+    ///
     /// Gated on `terminal.task().is_none()` so this never observes the same
     /// terminals `poll_task_terminals` already covers. Not unit-tested
     /// directly: exercising this gate needs a real PTY-backed `Terminal`
@@ -845,6 +902,7 @@ impl NucleusEngine {
 
         let mut live_ids = HashSet::default();
         let mut to_inject: Vec<Entity<terminal::Terminal>> = Vec::new();
+        let mut to_subscribe: Vec<Entity<terminal::Terminal>> = Vec::new();
         for pane in terminal_panel.read(cx).panes() {
             for terminal_view in pane.read(cx).items_of_type::<TerminalView>() {
                 let terminal = terminal_view.read(cx).terminal();
@@ -855,6 +913,9 @@ impl NucleusEngine {
                 }
                 let entity_id = terminal.entity_id();
                 live_ids.insert(entity_id);
+                if !self.terminal_subscriptions.contains_key(&entity_id) {
+                    to_subscribe.push(terminal.clone());
+                }
                 if !self.terminal_watcher.needs_injection(entity_id) {
                     continue;
                 }
@@ -868,6 +929,21 @@ impl NucleusEngine {
                 }
                 to_inject.push(terminal.clone());
             }
+        }
+
+        // Deferred until `terminal_panel`/`pane`'s borrow of `cx` above has
+        // ended — `cx.subscribe` needs `cx` mutably, same reason `to_inject`
+        // below is collected during the scan and only acted on afterwards.
+        for terminal in to_subscribe {
+            let entity_id = terminal.entity_id();
+            let subscription = cx.subscribe(&terminal, |this, _terminal, event, cx| {
+                if matches!(event, terminal::Event::SelectionsChanged) {
+                    this.terminal_selection_timestamps.push_back(Instant::now());
+                    this.last_activity_at = Instant::now();
+                    this.refresh(cx);
+                }
+            });
+            self.terminal_subscriptions.insert(entity_id, subscription);
         }
 
         for terminal in to_inject {
@@ -904,6 +980,8 @@ impl NucleusEngine {
         }
 
         self.terminal_watcher.prune(&live_ids);
+        self.terminal_subscriptions
+            .retain(|id, _| live_ids.contains(id));
         self.poll_marker_files(&live_ids, cx);
     }
 
@@ -938,9 +1016,7 @@ impl NucleusEngine {
                         // command name is never itself the secret-shaped
                         // part `redact_command` targets — see
                         // `categorize_command`'s doc comment).
-                        if categorize_command(&command) == CommandCategory::Test
-                            && exit_code == 0
-                        {
+                        if categorize_command(&command) == CommandCategory::Test && exit_code == 0 {
                             self.test_pass_timestamps.push_back(Instant::now());
                         }
                         self.record_raw_event(
@@ -982,10 +1058,15 @@ impl NucleusEngine {
         let density_cutoff = now.checked_sub(DENSITY_RETENTION_WINDOW).unwrap_or(now);
         self.edit_timestamps.retain(|at| *at >= density_cutoff);
         self.selection_timestamps.retain(|at| *at >= density_cutoff);
+        self.terminal_selection_timestamps
+            .retain(|at| *at >= density_cutoff);
         self.poll_task_terminals(cx);
         self.poll_plain_terminals(cx);
         self.session_state.agent_active = self.compute_agent_active(window, cx);
-        self.session_state.focused_pane = self.compute_focused_pane(window, cx);
+        let (focused_pane, focused_terminal_id) = self.compute_focused_pane(window, cx);
+        self.session_state.focused_pane = focused_pane;
+        self.session_state.focused_terminal_last_command = focused_terminal_id
+            .and_then(|entity_id| self.terminal_watcher.last_completed_command(entity_id));
         self.session_state.cursor_at_diagnostic = self.compute_cursor_at_diagnostic(cx);
         self.refresh(cx);
     }
@@ -1005,31 +1086,42 @@ impl NucleusEngine {
         panel.active_thread_id(cx).is_some() && panel.focus_handle(cx).contains_focused(window, cx)
     }
 
-    /// Part C: mild prior. Agent-panel focus isn't checked here — see
-    /// `FocusedPane`'s doc comment for why that's `compute_agent_active`'s
-    /// job alone, not a second weaker signal here too.
-    fn compute_focused_pane(&self, window: &mut Window, cx: &mut App) -> FocusedPane {
+    /// Part C, revised by the terminal-engagement session: pane focus is no
+    /// longer a direct scoring input (see `FocusedPane`'s doc comment) —
+    /// this now also returns *which* terminal is focused (its `EntityId`)
+    /// when that's the answer, so `prune_and_refresh` can look up that
+    /// specific terminal's last completed command
+    /// (`SessionState::focused_terminal_last_command`) rather than just
+    /// knowing *a* terminal has focus. Agent-panel focus isn't checked here
+    /// — see `FocusedPane`'s doc comment for why that's
+    /// `compute_agent_active`'s job alone, not a second weaker signal here
+    /// too.
+    fn compute_focused_pane(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (FocusedPane, Option<EntityId>) {
         if let Some(editor) = self.active_editor.as_ref()
             && editor.focus_handle(cx).contains_focused(window, cx)
         {
-            return FocusedPane::Editor;
+            return (FocusedPane::Editor, None);
         }
 
         let Some(workspace) = self.workspace.upgrade() else {
-            return FocusedPane::Other;
+            return (FocusedPane::Other, None);
         };
         let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
-            return FocusedPane::Other;
+            return (FocusedPane::Other, None);
         };
-        let has_focused_terminal = terminal_panel.read(cx).panes().iter().any(|pane| {
+        let focused_terminal_id = terminal_panel.read(cx).panes().iter().find_map(|pane| {
             pane.read(cx)
                 .items_of_type::<TerminalView>()
-                .any(|terminal_view| terminal_view.focus_handle(cx).contains_focused(window, cx))
+                .find(|terminal_view| terminal_view.focus_handle(cx).contains_focused(window, cx))
+                .map(|terminal_view| terminal_view.read(cx).terminal().entity_id())
         });
-        if has_focused_terminal {
-            FocusedPane::Terminal
-        } else {
-            FocusedPane::Other
+        match focused_terminal_id {
+            Some(entity_id) => (FocusedPane::Terminal, Some(entity_id)),
+            None => (FocusedPane::Other, None),
         }
     }
 
@@ -1057,7 +1149,9 @@ impl NucleusEngine {
             buffer_snapshot
                 .diagnostics_in_range::<_, text::Point>(full_range, false)
                 .filter(|entry| entry.diagnostic.severity == lsp::DiagnosticSeverity::ERROR)
-                .any(|entry| cursor_row.abs_diff(entry.range.start.row) <= DIAGNOSTIC_LOCATION_LINE_WINDOW)
+                .any(|entry| {
+                    cursor_row.abs_diff(entry.range.start.row) <= DIAGNOSTIC_LOCATION_LINE_WINDOW
+                })
         })
     }
 
@@ -1103,6 +1197,7 @@ impl NucleusEngine {
             large_edits: self.large_edit_timestamps.len() as u32,
             edit_events: decayed_density(&self.edit_timestamps, now),
             navigation_events: decayed_density(&self.selection_timestamps, now),
+            terminal_activity_events: decayed_density(&self.terminal_selection_timestamps, now),
         };
         self.session_state.test_command_running = self
             .terminal_watcher
@@ -1187,14 +1282,19 @@ const WEIGHT_EDIT_BURST_EACH_EXTRA: f32 = 0.15;
 /// diminishing-returns shape as the other `.min(N)`-capped counts below.
 const MAX_BURST_EDITS_COUNTED: u32 = 4;
 
-/// Part C, pane-focus prior: deliberately small — this is a tie-breaker, not
-/// a driver. Terminal focus only distinguishes Debugging from Implementing/
-/// Idle for now, since Testing isn't implemented yet (a terminal could just
-/// as easily mean "running the app," not "running tests").
-const WEIGHT_TERMINAL_FOCUS: f32 = 0.08;
-/// Part C, pane-focus prior: same magnitude and same reasoning as
-/// [`WEIGHT_TERMINAL_FOCUS`], mirrored for Implementing.
-const WEIGHT_EDITOR_FOCUS: f32 = 0.08;
+/// Terminal-engagement session, Part B: how close the top two categories'
+/// *normalized* probabilities need to be for `state.focused_pane` to break
+/// the tie (see `apply_focus_tiebreaker`) — replaces the old
+/// `WEIGHT_TERMINAL_FOCUS`/`WEIGHT_EDITOR_FOCUS` flat priors, which added
+/// unconditionally regardless of how close or far apart the categories
+/// already were, despite their own doc comments already calling them
+/// "tie-breakers." Five percentage points: comfortably below a real,
+/// decisive gap (e.g. 0.30 vs 0.15 is obviously not a tie), but wide enough
+/// to actually fire for the near-ties this is meant to catch (two
+/// comparably-weighted signals landing within a point or two of each
+/// other) rather than requiring near-exact equality that realistically
+/// never happens with continuous, independently-summed scores.
+const FOCUS_TIE_MARGIN: f32 = 0.05;
 /// Part C, diagnostic-location correlation: deliberately larger than
 /// [`WEIGHT_DIAGNOSTIC_ERRORS`] (0.15) — "editing exactly where the failure
 /// pointed" is close to unambiguous, versus "there's an error somewhere in
@@ -1286,6 +1386,77 @@ const WEIGHT_TEST_RECENTLY_PASSED: f32 = 0.45;
 /// unambiguous once it's true at all.
 const WEIGHT_CONFIG_FILE_EDIT: f32 = 0.55;
 
+// ---- Terminal-engagement session: Part A (terminal-engagement signal),
+// Part B (pane-focus demoted to tiebreaker, see `FOCUS_TIE_MARGIN` above).
+// See `classify`'s doc comment for how these fit together. ----
+
+/// Base contribution once decayed `RecentActions::terminal_activity_events`
+/// reaches [`MIN_TERMINAL_ACTIVITY_FOR_SIGNAL`], when the *focused*
+/// terminal's most recently completed command failed (non-zero exit) — the
+/// terminal analog of [`WEIGHT_CURSOR_AT_DIAGNOSTIC`]: engaging with the
+/// output of a known failure.
+///
+/// Deliberately smaller than `WEIGHT_CURSOR_AT_DIAGNOSTIC` (0.30): a cursor
+/// at a diagnostic's exact line is a precise, localized correlation ("the
+/// user is looking at literally the broken line"), while "selecting/
+/// scrolling somewhere in a terminal pane whose last command failed" only
+/// localizes to the *pane*, not a specific line of its output — the
+/// failure could be several commands back in scrollback by the time the
+/// user scrolls, or they could be reading something else in the same pane
+/// entirely. This is the same shape of discount this file already applies
+/// elsewhere for weaker localization: [`WEIGHT_DIAGNOSTIC_ERRORS`] (0.15,
+/// "an error exists somewhere in this file") sits at almost exactly half
+/// of `WEIGHT_CURSOR_AT_DIAGNOSTIC` (0.30, "the cursor is on that exact
+/// line") for the identical reason. Terminal-engagement-failed sits above
+/// that file-level floor, though — a *completed* command's exit code is a
+/// firmer, more recent fact than "a diagnostic is open somewhere" (which
+/// can be stale or already-being-ignored), and real selection/scroll
+/// activity is a comparably deliberate attention marker to a cursor
+/// movement — so 0.20 splits the difference: a genuine discount from
+/// `WEIGHT_CURSOR_AT_DIAGNOSTIC` for the weaker localization, without
+/// discounting all the way down to `WEIGHT_DIAGNOSTIC_ERRORS`'s "just
+/// exists somewhere" tier.
+const WEIGHT_TERMINAL_ENGAGEMENT_FAILED: f32 = 0.20;
+/// Base contribution when the focused terminal's most recently completed
+/// command was `Test`-category, *regardless of pass/fail* — reading a
+/// test's output is part of the testing activity either way, unlike the
+/// failed/succeeded split used for Debugging/Exploring. Same magnitude and
+/// reasoning as [`WEIGHT_TERMINAL_ENGAGEMENT_FAILED`] (weaker localization
+/// than an exact correlation), deliberately well below
+/// [`WEIGHT_TEST_RUNNING`]/[`WEIGHT_TEST_RECENTLY_PASSED`] (0.55/0.45) —
+/// those are near-ground-truth ("a test is running/just passed *right
+/// now*", read directly off `terminal_watcher`'s own pending/just-finished
+/// state), while this is inferred engagement ("the user is looking at a
+/// terminal whose last command happened to be a test"), the same weaker
+/// tier as the failed-command signal above.
+const WEIGHT_TERMINAL_ENGAGEMENT_TEST: f32 = 0.20;
+/// Base contribution when the focused terminal's most recently completed
+/// command succeeded and wasn't a test (e.g. `git log`, a clean build) —
+/// the terminal analog of Exploring's own navigation-density signal
+/// (`WEIGHT_NAVIGATION_DENSITY`): building understanding without changing
+/// anything, just happening in a terminal pane instead of the editor.
+/// Below `WEIGHT_NAVIGATION_DENSITY` (0.45) rather than matching it — dense
+/// cross-file selection/navigation in the editor is a richer, more
+/// sustained browsing pattern than "the last terminal command happened to
+/// exit zero and wasn't a test," which is a thinner, more incidental fact.
+const WEIGHT_TERMINAL_ENGAGEMENT_EXPLORING: f32 = 0.25;
+/// Shared bonus-per-unit-density scale for all three
+/// `WEIGHT_TERMINAL_ENGAGEMENT_*` signals above, once decayed density
+/// clears [`MIN_TERMINAL_ACTIVITY_FOR_SIGNAL`] — same shape and same
+/// magnitude as [`WEIGHT_EDIT_DENSITY_PER_EXTRA`]/
+/// [`WEIGHT_NAVIGATION_DENSITY_PER_EXTRA`] (both 0.06/0.05), not a new
+/// scale invented for this signal specifically.
+const WEIGHT_TERMINAL_ENGAGEMENT_PER_EXTRA: f32 = 0.06;
+/// Same reasoning and same value as [`MIN_EDIT_DENSITY_FOR_SIGNAL`]/
+/// [`MIN_NAVIGATION_DENSITY_FOR_EXPLORING`]: a single, just-happened
+/// selection contributes almost exactly 1.0 to the decayed sum, so
+/// requiring at least 2.0 means it takes more than one incidental
+/// selection to count as genuine engagement.
+const MIN_TERMINAL_ACTIVITY_FOR_SIGNAL: f32 = 2.0;
+/// Same cap and reasoning as [`MAX_EDIT_DENSITY_COUNTED`]/
+/// [`MAX_NAVIGATION_DENSITY_COUNTED`].
+const MAX_TERMINAL_ACTIVITY_COUNTED: f32 = 8.0;
+
 /// File extensions recognized as configuration for
 /// [`is_recognized_config_file`] — deliberately small and easy to extend
 /// rather than exhaustive, per Part D's own scope.
@@ -1367,6 +1538,135 @@ fn idle_activity_floor(pause_seconds: u64) -> f32 {
     (pause_seconds as f32 / PAUSE_INVESTIGATING_MAX_SECS as f32).clamp(0.0, 1.0)
 }
 
+/// Terminal-engagement session, Part A: the focused terminal's most
+/// recently completed command, but only once there's been enough recent
+/// selection/scroll density in a terminal pane to call it genuine
+/// engagement — mirrors `MIN_EDIT_DENSITY_FOR_SIGNAL`'s "more than one
+/// incidental event" reasoning, applied to `terminal_activity_events`
+/// instead of `edit_events`.
+///
+/// Returns `None` whenever `state.focused_terminal_last_command` itself is
+/// `None` — no terminal is focused, or the focused terminal hasn't had a
+/// command finish in it yet (Part A rule 4). That case deliberately
+/// contributes nothing here, not even to Idle's own floor: `pause_seconds`
+/// already captures "how long since anything happened" independently (and
+/// the selection/scroll activity that feeds `terminal_activity_events`
+/// already resets it, the same way every other activity signal in this
+/// file does), so there's no separate "no completed command yet" case for
+/// Idle to react to beyond what the pause-driven floor already covers —
+/// adding a second, redundant idle-floor path here would just double-count
+/// the same underlying fact (recent activity exists) under a different
+/// name. See `classify`'s doc comment for how the `Some` case routes.
+fn terminal_engagement(state: &SessionState) -> Option<LastCommandOutcome> {
+    state.focused_terminal_last_command.filter(|_| {
+        state.recent_actions.terminal_activity_events >= MIN_TERMINAL_ACTIVITY_FOR_SIGNAL
+    })
+}
+
+/// Terminal-engagement session, Part B: whether `focused_pane` should
+/// override the already-selected `(current_intent, current_probability,
+/// current_evidence)` — replacing the old flat `WEIGHT_TERMINAL_FOCUS`/
+/// `WEIGHT_EDITOR_FOCUS` priors, which added to Debugging's/Implementing's
+/// score unconditionally, regardless of how the rest of scoring looked.
+/// Now `focused_pane` only ever *breaks a tie* between two already-close
+/// candidates: the pane's own associated intent (`Debugging` for a
+/// focused terminal, `Implementing` for a focused editor) has to be the
+/// genuine runner-up — the literal second-highest of all six normalized
+/// probabilities, `probabilities` — and within [`FOCUS_TIE_MARGIN`] of the
+/// current winner, before this changes anything. See `classify`'s doc
+/// comment for the full reframe this implements.
+///
+/// No-ops (`current` returned unchanged) whenever: no pane is focused
+/// (`FocusedPane::Other`), the focused pane's own intent is already
+/// winning (nothing to break a tie *toward* — it already reflects the
+/// contextually plausible choice), or the focused pane's intent isn't the
+/// actual runner-up, or the runner-up isn't close enough to the winner.
+/// This last check is deliberately against the *true* top two (not just
+/// "is the favored intent's own probability numerically close to the
+/// winner's"): a favored intent that happens to sit near the winner's
+/// score while a *third*, unrelated category is the real runner-up
+/// shouldn't be promoted just because of incidental numeric proximity —
+/// pane focus can only meaningfully arbitrate an actual two-way tie.
+fn apply_focus_tiebreaker(
+    probabilities: &mut [(DeveloperIntent, f32)],
+    focused_pane: FocusedPane,
+    current: (DeveloperIntent, f32, Vec<String>),
+    debugging_evidence: &[String],
+    implementing_evidence: &[String],
+) -> (DeveloperIntent, f32, Vec<String>) {
+    let favored_intent = match focused_pane {
+        FocusedPane::Terminal => DeveloperIntent::Debugging,
+        FocusedPane::Editor => DeveloperIntent::Implementing,
+        FocusedPane::Other => return current,
+    };
+    if current.0 == favored_intent {
+        return current;
+    }
+
+    // The true runner-up: the highest probability among every candidate
+    // *other than* the current winner. Deliberately not re-derived via a
+    // fresh sort over all six — `current.0` was already chosen by
+    // `classify`'s own priority-ordered winner selection, which breaks
+    // exact ties by a specific documented order (Testing > Debugging >
+    // Configuring > Implementing > Exploring > Idle); a plain sort instead
+    // breaks ties by `DeveloperIntent::ALL`'s declaration order, which
+    // disagrees with that on at least one pair (`Implementing` is declared
+    // before `Testing`) — re-deriving "the top" independently could
+    // therefore pick a different intent than `current.0` on an exact tie,
+    // even though the *value* is identical either way. Trusting `current`
+    // as the winner and only searching the rest for the runner-up sidesteps
+    // that disagreement entirely.
+    let runner_up = probabilities
+        .iter()
+        .filter(|(intent, _)| *intent != current.0)
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .copied();
+    let Some((second_intent, second_probability)) = runner_up else {
+        return current;
+    };
+
+    if second_intent == favored_intent && (current.1 - second_probability) <= FOCUS_TIE_MARGIN {
+        // `classify`'s own contract (checked by `classify_stress_tests::
+        // classify_never_violates_its_own_contract`) requires the selected
+        // intent's `confidence` to both (a) equal its own entry in
+        // `probabilities` and (b) be the argmax of that same array. Simply
+        // relabeling `current` to `favored_intent` while leaving
+        // `probabilities` untouched can't satisfy both at once —
+        // `favored_intent`'s own entry is `second_probability`, strictly
+        // less than `current.1`, so it would either mismatch its own
+        // "confidence" or no longer be the argmax. The fix: swap the two
+        // entries' *values* in `probabilities` (not just the headline
+        // fields), so the whole snapshot stays self-consistent — `current.0`
+        // keeps its real score by taking on `second_probability`,
+        // `favored_intent` takes on `current.1` (the former max). A swap
+        // rather than a one-sided overwrite also leaves the sum across all
+        // six entries exactly unchanged: this is a relabeling of which
+        // near-tied category the moment gets attributed to, not new
+        // evidence that should shift total probability mass.
+        for entry in probabilities.iter_mut() {
+            if entry.0 == current.0 {
+                entry.1 = second_probability;
+            } else if entry.0 == favored_intent {
+                entry.1 = current.1;
+            }
+        }
+
+        let evidence = match favored_intent {
+            DeveloperIntent::Debugging => debugging_evidence,
+            DeveloperIntent::Implementing => implementing_evidence,
+            _ => unreachable!("favored_intent is always Debugging or Implementing"),
+        };
+        let mut evidence = evidence.to_vec();
+        evidence.push(format!(
+            "near-tie with {} broken toward this by which pane is focused",
+            current.0.label()
+        ));
+        (favored_intent, current.1, evidence)
+    } else {
+        current
+    }
+}
+
 /// Weighted rule-based scoring for [`DeveloperIntent::Debugging`],
 /// [`DeveloperIntent::Implementing`], [`DeveloperIntent::Testing`],
 /// [`DeveloperIntent::Exploring`], and [`DeveloperIntent::Configuring`].
@@ -1430,11 +1730,14 @@ fn idle_activity_floor(pause_seconds: u64) -> f32 {
 /// stale, unrelated signal (e.g. a failed test run from minutes ago) dilute
 /// ground truth, which defeats the point of it being ground truth.
 ///
-/// `state.focused_pane` and `state.cursor_at_diagnostic` (Part C), by
-/// contrast, *are* additional weighted contributions within the existing
-/// Debugging/Implementing scoring below — deliberately small priors
-/// ([`WEIGHT_TERMINAL_FOCUS`]/[`WEIGHT_EDITOR_FOCUS`]) or a sharper
-/// correlation signal ([`WEIGHT_CURSOR_AT_DIAGNOSTIC`]), not gates.
+/// `state.cursor_at_diagnostic` (Part C) *is* an additional weighted
+/// contribution within Debugging's scoring below — a sharper correlation
+/// signal ([`WEIGHT_CURSOR_AT_DIAGNOSTIC`]), not a gate.
+///
+/// `state.focused_pane`, by contrast, is **not** a weighted contribution as
+/// of the terminal-engagement session — see "Terminal-engagement session"
+/// below for what replaced its old flat `WEIGHT_TERMINAL_FOCUS`/
+/// `WEIGHT_EDITOR_FOCUS` priors.
 ///
 /// ## Parts A-D (classifier-expansion session)
 ///
@@ -1506,6 +1809,76 @@ fn idle_activity_floor(pause_seconds: u64) -> f32 {
 /// session report and `docs/PHASE6_INTERRUPTION_NOTES.md`. None of them
 /// changed anything in this function; they're recorded there, not here.
 ///
+/// ## Terminal-engagement session
+///
+/// Motivating bug, confirmed from a real logged trace: `Idle 92% —
+/// terminal currently focused (not enough alone to indicate active work)`.
+/// Correctly downweighted alone — the real problem was that `focused_pane`
+/// was the *only* thing this function knew about terminal activity at all.
+/// There's no terminal equivalent of the editor's edit-density/navigation-
+/// density for engagement (selecting/scrolling output), so a user actively
+/// reading a stack trace or test's output in the terminal could register as
+/// nothing.
+///
+/// **Part A** adds that missing signal: a third decayed-density field,
+/// `RecentActions::terminal_activity_events`, fed by
+/// `terminal::Event::SelectionsChanged` on plain terminals (not scroll —
+/// see `NucleusEngine::poll_plain_terminals`'s doc comment for why that's
+/// the one piece of "selection/scroll" this doesn't capture: no low-noise
+/// dedicated event exists for pure scrolling in this terminal stack, and
+/// reusing `Event::Wakeup` would be far too noisy — it fires for reasons
+/// entirely unrelated to user engagement, like output arriving or cursor
+/// blink). `terminal_engagement` gates that density against
+/// `MIN_TERMINAL_ACTIVITY_FOR_SIGNAL` and, if it clears the bar, returns
+/// `state.focused_terminal_last_command` — the *focused* terminal's most
+/// recently completed command's category and exit code (`None` if no
+/// terminal is focused, or nothing has finished in it yet — see that
+/// function's own doc comment for why that case contributes nothing rather
+/// than something to Idle's floor).
+///
+/// That result routes three ways, as three *independent* checks (not an
+/// if/else chain — see below for why a failed test command deliberately
+/// satisfies two of them at once):
+///
+/// 1. The command **failed** (any category) → `WEIGHT_TERMINAL_ENGAGEMENT_
+///    FAILED` into Debugging — engaging with the output of a known
+///    failure, the terminal analog of `cursor_at_diagnostic`.
+/// 2. The command was **`Test`-category** (regardless of pass/fail) →
+///    `WEIGHT_TERMINAL_ENGAGEMENT_TEST` into Testing — reading a test's
+///    output is part of the testing activity whether it passed or failed.
+/// 3. The command **succeeded and wasn't a test** → `WEIGHT_TERMINAL_
+///    ENGAGEMENT_EXPLORING` into Exploring — the same "building
+///    understanding without changing anything" pattern Exploring already
+///    models for the editor, just happening in a terminal pane.
+///
+/// Checks 1 and 2 aren't mutually exclusive: a *failed test* satisfies
+/// both ("failed, any category" and "Test-category, regardless of
+/// pass/fail" are each true), so it contributes to both Debugging and
+/// Testing simultaneously — deliberately, not an oversight. A failed test
+/// genuinely is both debugging-flavored (something broke, needs fixing)
+/// and testing-flavored (the user is looking at test output); there's no
+/// single "more correct" bucket for it, the same way `RecentActions::
+/// failed_test_runs` (task-runner) and `state.test_command_running`/
+/// `test_command_recently_passed` (plain-terminal) are already
+/// structurally allowed to both score independently rather than being
+/// forced to pick one. Check 3's own condition (succeeded *and* not a
+/// test) is inherently exclusive of 1 and 2 by construction, so it never
+/// overlaps with either.
+///
+/// **Part B** replaces `state.focused_pane`'s old behavior: it used to add
+/// a flat `WEIGHT_TERMINAL_FOCUS`/`WEIGHT_EDITOR_FOCUS` straight to
+/// Debugging's/Implementing's score, unconditionally — contributing the
+/// same fixed amount whether the rest of scoring already clearly favored
+/// that category, clearly favored something else, or was a genuine
+/// near-tie. `apply_focus_tiebreaker` (called once, after the normal
+/// priority-order winner selection below) instead only ever *swaps* the
+/// already-chosen winner for the focused pane's associated intent when
+/// that intent is the true runner-up and within `FOCUS_TIE_MARGIN` of the
+/// winner — i.e. `focused_pane` now decides which content-aware signals
+/// are even relevant (gating `terminal_engagement` above) rather than
+/// casting an unconditional vote of its own. This is the reframe the whole
+/// session implements: pane focus as a *context selector*, not a vote.
+///
 /// ## Normalization, extended
 ///
 /// `idle_score` and `total` now sum all six weighted categories (Debugging,
@@ -1545,6 +1918,16 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
     }
 
     let actions = &state.recent_actions;
+    // Terminal-engagement session, Part A: computed once, shared across the
+    // Debugging/Testing/Exploring blocks below — see `terminal_engagement`'s
+    // doc comment and `classify`'s own "Terminal-engagement session"
+    // section for how the `Some` case routes three ways.
+    let terminal_engagement = terminal_engagement(state);
+    let terminal_engagement_bonus = WEIGHT_TERMINAL_ENGAGEMENT_PER_EXTRA
+        * (actions
+            .terminal_activity_events
+            .min(MAX_TERMINAL_ACTIVITY_COUNTED)
+            - MIN_TERMINAL_ACTIVITY_FOR_SIGNAL);
 
     let mut debugging_score = 0.0f32;
     let mut debugging_evidence = Vec::new();
@@ -1605,9 +1988,19 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
             "cursor within {DIAGNOSTIC_LOCATION_LINE_WINDOW} line(s) of an active error"
         ));
     }
-    if state.focused_pane == FocusedPane::Terminal {
-        debugging_score += WEIGHT_TERMINAL_FOCUS;
-        debugging_evidence.push("terminal currently focused".to_string());
+    // Terminal-engagement session, Part A rule 1: the focused terminal's
+    // last completed command failed, any category — the terminal analog of
+    // `cursor_at_diagnostic` above. See `classify`'s doc comment for why
+    // this deliberately isn't exclusive with the Testing check below (a
+    // failed test contributes to both).
+    if let Some(last_command) = terminal_engagement
+        && last_command.exit_code != 0
+    {
+        debugging_score += WEIGHT_TERMINAL_ENGAGEMENT_FAILED + terminal_engagement_bonus;
+        debugging_evidence.push(format!(
+            "selecting/scrolling in the terminal after its last command failed (exit {})",
+            last_command.exit_code
+        ));
     }
     debugging_score = debugging_score.min(1.0);
 
@@ -1653,8 +2046,8 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
     // sum (not a raw count) by the time it reaches here.
     if actions.edit_events >= MIN_EDIT_DENSITY_FOR_SIGNAL {
         let counted = actions.edit_events.min(MAX_EDIT_DENSITY_COUNTED);
-        implementing_score +=
-            WEIGHT_EDIT_DENSITY + WEIGHT_EDIT_DENSITY_PER_EXTRA * (counted - MIN_EDIT_DENSITY_FOR_SIGNAL);
+        implementing_score += WEIGHT_EDIT_DENSITY
+            + WEIGHT_EDIT_DENSITY_PER_EXTRA * (counted - MIN_EDIT_DENSITY_FOR_SIGNAL);
         implementing_evidence.push(format!(
             "frequent recent edits (recency-weighted density {:.1}, decaying over ~{:.0}s)",
             actions.edit_events, DENSITY_DECAY_TIME_CONSTANT_SECS
@@ -1667,10 +2060,6 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
     if state.pause_seconds < 10 {
         implementing_score += WEIGHT_CONTINUOUS_ACTIVITY;
         implementing_evidence.push("continuous editing activity, no long pauses".to_string());
-    }
-    if state.focused_pane == FocusedPane::Editor {
-        implementing_score += WEIGHT_EDITOR_FOCUS;
-        implementing_evidence.push("editor currently focused".to_string());
     }
     implementing_score = implementing_score.min(1.0);
 
@@ -1694,6 +2083,18 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
             ACTIVITY_BURST_WINDOW.as_secs()
         ));
     }
+    // Terminal-engagement session, Part A rule 2: the focused terminal's
+    // last completed command was `Test`-category, regardless of pass/fail
+    // — reading a test's output is part of the testing activity either
+    // way. Deliberately not exclusive with the Debugging check above (a
+    // failed test scores both) — see `classify`'s doc comment.
+    if let Some(last_command) = terminal_engagement
+        && last_command.category == CommandCategory::Test
+    {
+        testing_score += WEIGHT_TERMINAL_ENGAGEMENT_TEST + terminal_engagement_bonus;
+        testing_evidence
+            .push("selecting/scrolling in the terminal after a test command".to_string());
+    }
     testing_score = testing_score.min(1.0);
 
     // --- Exploring signals (Part C) ---
@@ -1705,9 +2106,12 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
     if actions.navigation_events >= MIN_NAVIGATION_DENSITY_FOR_EXPLORING
         && actions.edit_events <= MAX_EDIT_DENSITY_FOR_LOW_EDIT_ACTIVITY
     {
-        let counted = actions.navigation_events.min(MAX_NAVIGATION_DENSITY_COUNTED);
+        let counted = actions
+            .navigation_events
+            .min(MAX_NAVIGATION_DENSITY_COUNTED);
         exploring_score += WEIGHT_NAVIGATION_DENSITY
-            + WEIGHT_NAVIGATION_DENSITY_PER_EXTRA * (counted - MIN_NAVIGATION_DENSITY_FOR_EXPLORING);
+            + WEIGHT_NAVIGATION_DENSITY_PER_EXTRA
+                * (counted - MIN_NAVIGATION_DENSITY_FOR_EXPLORING);
         exploring_evidence.push(format!(
             "frequent recent navigation with little/no editing (recency-weighted density {:.1}, \
             browsing/reading)",
@@ -1717,6 +2121,21 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
     if state.pause_seconds < 10 {
         exploring_score += WEIGHT_EXPLORING_CONTINUOUS;
         exploring_evidence.push("actively navigating, no long pauses".to_string());
+    }
+    // Terminal-engagement session, Part A rule 3: the focused terminal's
+    // last completed command succeeded and wasn't a test — the terminal
+    // analog of the navigation-density signal above (building
+    // understanding without changing anything). Inherently exclusive of
+    // both checks above by its own condition, so this never overlaps with
+    // Debugging or Testing.
+    if let Some(last_command) = terminal_engagement
+        && last_command.exit_code == 0
+        && last_command.category != CommandCategory::Test
+    {
+        exploring_score += WEIGHT_TERMINAL_ENGAGEMENT_EXPLORING + terminal_engagement_bonus;
+        exploring_evidence.push(
+            "selecting/scrolling in the terminal after a successful, non-test command".to_string(),
+        );
     }
     exploring_score = exploring_score.min(1.0);
 
@@ -1766,7 +2185,7 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
     let exploring_probability = exploring_score / total;
     let configuring_probability = configuring_score / total;
 
-    let probabilities = DeveloperIntent::ALL
+    let mut probabilities: Vec<(DeveloperIntent, f32)> = DeveloperIntent::ALL
         .into_iter()
         .map(|intent| {
             let probability = match intent {
@@ -1804,8 +2223,16 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
     //      categories above it.
     //   6. Idle — unchanged lowest-priority fallback.
     let candidates = [
-        (DeveloperIntent::Testing, testing_probability, testing_evidence),
-        (DeveloperIntent::Debugging, debugging_probability, debugging_evidence),
+        (
+            DeveloperIntent::Testing,
+            testing_probability,
+            testing_evidence,
+        ),
+        (
+            DeveloperIntent::Debugging,
+            debugging_probability,
+            debugging_evidence.clone(),
+        ),
         (
             DeveloperIntent::Configuring,
             configuring_probability,
@@ -1814,9 +2241,13 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
         (
             DeveloperIntent::Implementing,
             implementing_probability,
-            implementing_evidence,
+            implementing_evidence.clone(),
         ),
-        (DeveloperIntent::Exploring, exploring_probability, exploring_evidence),
+        (
+            DeveloperIntent::Exploring,
+            exploring_probability,
+            exploring_evidence,
+        ),
     ];
 
     let mut winner: Option<(DeveloperIntent, f32, Vec<String>)> = None;
@@ -1850,6 +2281,19 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
         };
         (DeveloperIntent::Idle, idle_probability, evidence)
     };
+
+    // Terminal-engagement session, Part B: pane focus gets one last chance
+    // to break a genuine near-tie — see `apply_focus_tiebreaker`'s doc
+    // comment. A no-op the overwhelming majority of the time (no pane
+    // focused, the focused pane's intent already won, or nothing's
+    // actually close).
+    let (intent, confidence, evidence) = apply_focus_tiebreaker(
+        &mut probabilities,
+        state.focused_pane,
+        (intent, confidence, evidence),
+        &debugging_evidence,
+        &implementing_evidence,
+    );
 
     IntentPrediction {
         prediction_id: PredictionId::new(),
@@ -1907,6 +2351,7 @@ mod tests {
                 large_edits: 0,
                 edit_events: 0.0,
                 navigation_events: 0.0,
+                terminal_activity_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 0,
@@ -1920,6 +2365,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         let prediction = classify(&state, None);
@@ -1976,6 +2422,7 @@ mod tests {
                 large_edits: 0,
                 edit_events: 0.0,
                 navigation_events: 0.0,
+                terminal_activity_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 1,
@@ -1989,6 +2436,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         let prediction = classify(&state, None);
@@ -2029,6 +2477,7 @@ mod tests {
                 large_edits: 0,
                 edit_events: 0.0,
                 navigation_events: 0.0,
+                terminal_activity_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 0,
@@ -2042,6 +2491,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         let prediction = classify(&state, Some(60));
@@ -2073,6 +2523,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         let prediction = classify(&state, None);
@@ -2100,6 +2551,7 @@ mod tests {
                 large_edits: 0,
                 edit_events: 0.0,
                 navigation_events: 0.0,
+                terminal_activity_events: 0.0,
             },
             diagnostics: DiagnosticsSummary::default(),
             current_symbol: None,
@@ -2110,6 +2562,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         let prediction = classify(&state, None);
@@ -2192,6 +2645,7 @@ mod tests {
                 large_edits: 0,
                 edit_events: 0.0,
                 navigation_events: 0.0,
+                terminal_activity_events: 0.0,
             },
             diagnostics: DiagnosticsSummary::default(),
             current_symbol: None,
@@ -2202,6 +2656,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         let prediction = classify(&state, None);
@@ -2251,6 +2706,7 @@ mod tests {
                 large_edits: 3,
                 edit_events: 0.0,
                 navigation_events: 0.0,
+                terminal_activity_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 16,
@@ -2264,16 +2720,14 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         let prediction = classify(&state, Some(220));
         println!(
             "sustained-edit-burst: intent={:?} confidence={:.3} probabilities={:?} \
             evidence={:?}",
-            prediction.intent,
-            prediction.confidence,
-            prediction.probabilities,
-            prediction.evidence
+            prediction.intent, prediction.confidence, prediction.probabilities, prediction.evidence
         );
 
         assert_eq!(
@@ -2318,6 +2772,7 @@ mod tests {
                 large_edits: 0,
                 edit_events: 0.0,
                 navigation_events: 0.0,
+                terminal_activity_events: 0.0,
             },
             diagnostics: DiagnosticsSummary::default(),
             current_symbol: None,
@@ -2328,6 +2783,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         let prediction = classify(&state, Some(80));
@@ -2386,9 +2842,7 @@ mod tests {
     fn test_decayed_density_drops_to_one_over_e_after_one_time_constant() {
         let now = Instant::now();
         let mut timestamps = VecDeque::new();
-        timestamps.push_back(
-            now - Duration::from_secs_f32(DENSITY_DECAY_TIME_CONSTANT_SECS),
-        );
+        timestamps.push_back(now - Duration::from_secs_f32(DENSITY_DECAY_TIME_CONSTANT_SECS));
         let density = decayed_density(&timestamps, now);
         let expected = 1.0 / std::f32::consts::E;
         assert!(
@@ -2437,9 +2891,7 @@ mod tests {
         assert!(inside_density < 0.5 && outside_density < 0.5);
     }
 
-    fn session_state_with(
-        mutate: impl FnOnce(&mut SessionState),
-    ) -> SessionState {
+    fn session_state_with(mutate: impl FnOnce(&mut SessionState)) -> SessionState {
         let mut state = SessionState {
             active_files: vec![PathBuf::from("main.py")],
             recent_actions: RecentActions::default(),
@@ -2452,6 +2904,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
         mutate(&mut state);
         state
@@ -2582,6 +3035,239 @@ mod tests {
         assert_eq!(prediction.intent, DeveloperIntent::Testing);
     }
 
+    /// Terminal-engagement session, Part A rule 1: a focused terminal whose
+    /// last completed command failed, with genuine selection/scroll
+    /// engagement (density above `MIN_TERMINAL_ACTIVITY_FOR_SIGNAL`),
+    /// resolves to Debugging — this is also the exact motivating scenario
+    /// ("terminal focused, a failed command was just run, selection
+    /// activity in that pane"), confirming it now resolves toward
+    /// Debugging instead of the old `Idle 92%` result.
+    #[test]
+    fn test_terminal_engagement_failed_command_resolves_to_debugging() {
+        let state = session_state_with(|state| {
+            state.focused_pane = FocusedPane::Terminal;
+            state.focused_terminal_last_command = Some(LastCommandOutcome {
+                category: CommandCategory::Other,
+                exit_code: 1,
+            });
+            // Sustained engagement (dragging/selecting across several lines
+            // while reading a stack trace), not just a single incidental
+            // selection — at the density cap so this demonstrates the
+            // signal resolving the motivating scenario on its own, without
+            // also depending on Part B's tiebreaker (that's tested
+            // separately below).
+            state.recent_actions.terminal_activity_events = MAX_TERMINAL_ACTIVITY_COUNTED;
+        });
+
+        let prediction = classify(&state, None);
+        println!(
+            "terminal-engagement-failed: intent={:?} confidence={:.3} probabilities={:?} \
+            evidence={:?}",
+            prediction.intent, prediction.confidence, prediction.probabilities, prediction.evidence
+        );
+
+        assert_eq!(
+            prediction.intent,
+            DeveloperIntent::Debugging,
+            "selecting/scrolling in a terminal whose last command failed should resolve to \
+            Debugging, not stay Idle"
+        );
+        assert!(
+            prediction.confidence > 0.3,
+            "should be meaningfully confident, not just barely edge out Idle: got {}",
+            prediction.confidence
+        );
+    }
+
+    /// Terminal-engagement session, Part A rule 2: a focused terminal whose
+    /// last completed command was `Test`-category resolves to Testing
+    /// regardless of whether it passed or failed.
+    ///
+    /// Deliberately uses `FocusedPane::Other` (not `Terminal`): rule 2's
+    /// routing itself only depends on `focused_terminal_last_command` +
+    /// density, not `focused_pane` — using `Terminal` here would also
+    /// engage Part B's tiebreaker for the `exit_code: 1` sub-case
+    /// specifically (a failed test ties Debugging and Testing exactly, per
+    /// rules 1 and 2 both firing at equal weight — see
+    /// `test_terminal_engagement_failed_test_command_scores_both_debugging_and_testing`
+    /// — and a focused terminal favors Debugging on that tie), which would
+    /// conflate what this test is checking with a separate, already
+    /// separately-tested mechanism.
+    #[test]
+    fn test_terminal_engagement_test_command_resolves_to_testing_regardless_of_outcome() {
+        for exit_code in [0, 1] {
+            let state = session_state_with(|state| {
+                state.focused_pane = FocusedPane::Other;
+                state.focused_terminal_last_command = Some(LastCommandOutcome {
+                    category: CommandCategory::Test,
+                    exit_code,
+                });
+                state.recent_actions.terminal_activity_events = MAX_TERMINAL_ACTIVITY_COUNTED;
+            });
+
+            let prediction = classify(&state, None);
+            println!(
+                "terminal-engagement-test (exit {exit_code}): intent={:?} confidence={:.3} \
+                probabilities={:?}",
+                prediction.intent, prediction.confidence, prediction.probabilities
+            );
+
+            assert_eq!(
+                prediction.intent,
+                DeveloperIntent::Testing,
+                "selecting/scrolling in a terminal whose last command was a test should \
+                resolve to Testing regardless of exit code {exit_code}"
+            );
+        }
+    }
+
+    /// Terminal-engagement session, Part A rule 3: a focused terminal whose
+    /// last completed command succeeded and wasn't a test (e.g. `git log`)
+    /// resolves to Exploring — the terminal analog of navigation-density.
+    #[test]
+    fn test_terminal_engagement_successful_non_test_command_resolves_to_exploring() {
+        let state = session_state_with(|state| {
+            state.focused_pane = FocusedPane::Terminal;
+            state.focused_terminal_last_command = Some(LastCommandOutcome {
+                category: CommandCategory::Git,
+                exit_code: 0,
+            });
+            state.recent_actions.terminal_activity_events = 4.0;
+        });
+
+        let prediction = classify(&state, None);
+        println!(
+            "terminal-engagement-exploring: intent={:?} confidence={:.3} probabilities={:?}",
+            prediction.intent, prediction.confidence, prediction.probabilities
+        );
+
+        assert_eq!(prediction.intent, DeveloperIntent::Exploring);
+    }
+
+    /// Terminal-engagement session: a *failed test* command deliberately
+    /// satisfies both rule 1 (failed, any category) and rule 2 (Test
+    /// category, regardless of pass/fail) at once — not a routing
+    /// conflict, but two independent, simultaneously-true facts about the
+    /// same command (see `classify`'s doc comment). Confirms both
+    /// Debugging *and* Testing score above zero for the same input, not
+    /// just that one of them wins.
+    #[test]
+    fn test_terminal_engagement_failed_test_command_scores_both_debugging_and_testing() {
+        let state = session_state_with(|state| {
+            state.focused_pane = FocusedPane::Terminal;
+            state.focused_terminal_last_command = Some(LastCommandOutcome {
+                category: CommandCategory::Test,
+                exit_code: 1,
+            });
+            state.recent_actions.terminal_activity_events = 4.0;
+        });
+
+        let prediction = classify(&state, None);
+        println!(
+            "terminal-engagement-failed-test: intent={:?} confidence={:.3} \
+            probabilities={:?}",
+            prediction.intent, prediction.confidence, prediction.probabilities
+        );
+
+        let debugging_probability = prediction
+            .probabilities
+            .iter()
+            .find(|(intent, _)| *intent == DeveloperIntent::Debugging)
+            .unwrap()
+            .1;
+        let testing_probability = prediction
+            .probabilities
+            .iter()
+            .find(|(intent, _)| *intent == DeveloperIntent::Testing)
+            .unwrap()
+            .1;
+        assert!(
+            debugging_probability > 0.0,
+            "a failed test command should still contribute to Debugging, got {debugging_probability}"
+        );
+        assert!(
+            testing_probability > 0.0,
+            "a failed test command should still contribute to Testing, got {testing_probability}"
+        );
+    }
+
+    /// Terminal-engagement session, Part A rule 4: a focused terminal with
+    /// *no* completed command yet (freshly opened, or only a start marker
+    /// seen so far) contributes nothing to Debugging/Testing, even with
+    /// genuine selection/scroll density present — engagement alone,
+    /// without a completed command to route by, isn't enough (see
+    /// `terminal_engagement`'s doc comment for why this deliberately
+    /// doesn't feed Idle's floor either). Doesn't check Exploring here —
+    /// its pre-existing `WEIGHT_EXPLORING_CONTINUOUS` "no long pause" bonus
+    /// fires unconditionally below 10s regardless of terminal state at all,
+    /// so a nonzero Exploring score in this scenario reflects that
+    /// unrelated signal, not terminal-engagement leakage.
+    #[test]
+    fn test_terminal_engagement_no_completed_command_contributes_nothing() {
+        let state = session_state_with(|state| {
+            state.focused_pane = FocusedPane::Terminal;
+            state.focused_terminal_last_command = None;
+            state.recent_actions.terminal_activity_events = 4.0;
+        });
+
+        let prediction = classify(&state, None);
+        println!(
+            "terminal-engagement-no-command: intent={:?} confidence={:.3} probabilities={:?}",
+            prediction.intent, prediction.confidence, prediction.probabilities
+        );
+
+        for intent in [DeveloperIntent::Debugging, DeveloperIntent::Testing] {
+            let probability = prediction
+                .probabilities
+                .iter()
+                .find(|(candidate, _)| *candidate == intent)
+                .unwrap()
+                .1;
+            assert_eq!(
+                probability, 0.0,
+                "{intent:?} should score exactly 0 with no completed command to route by, got \
+                {probability}"
+            );
+        }
+    }
+
+    /// Terminal-engagement session, Part A: density below
+    /// `MIN_TERMINAL_ACTIVITY_FOR_SIGNAL` (a single incidental selection,
+    /// not sustained engagement) shouldn't fire the signal even with a
+    /// completed, failed command present — mirrors
+    /// `test_lone_edit_does_not_trigger_density_signal`'s same reasoning
+    /// for `edit_events`.
+    #[test]
+    fn test_terminal_engagement_below_density_threshold_does_not_fire() {
+        let state = session_state_with(|state| {
+            state.focused_pane = FocusedPane::Terminal;
+            state.focused_terminal_last_command = Some(LastCommandOutcome {
+                category: CommandCategory::Other,
+                exit_code: 1,
+            });
+            state.recent_actions.terminal_activity_events = 1.0;
+        });
+
+        let prediction = classify(&state, None);
+        println!(
+            "terminal-engagement-below-threshold: intent={:?} confidence={:.3} \
+            probabilities={:?}",
+            prediction.intent, prediction.confidence, prediction.probabilities
+        );
+
+        let debugging_probability = prediction
+            .probabilities
+            .iter()
+            .find(|(intent, _)| *intent == DeveloperIntent::Debugging)
+            .unwrap()
+            .1;
+        assert_eq!(
+            debugging_probability, 0.0,
+            "a single incidental selection (density below the threshold) shouldn't fire the \
+            terminal-engagement signal, got {debugging_probability}"
+        );
+    }
+
     /// Part B boundary check: a *failed* test/task run (the existing,
     /// unrelated `RecentActions::failed_test_runs` path, driven by Zed's
     /// task runner) must still resolve to Debugging exactly as before —
@@ -2616,6 +3302,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         let prediction = classify(&state, None);
@@ -2753,9 +3440,7 @@ mod tests {
         assert!(is_recognized_config_file(std::path::Path::new(
             ".env.production"
         )));
-        assert!(!is_recognized_config_file(std::path::Path::new(
-            "main.py"
-        )));
+        assert!(!is_recognized_config_file(std::path::Path::new("main.py")));
     }
 
     /// Normalization sanity check: with all six weighted categories now
@@ -2828,6 +3513,7 @@ mod tests {
                 large_edits: 0,
                 edit_events: 0.0,
                 navigation_events: 0.0,
+                terminal_activity_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 2,
@@ -2841,6 +3527,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
         logger.log_intent_prediction(&prediction, &session_state);
         logger.log_raw_event(&RawEvent::Edit {
@@ -2971,6 +3658,7 @@ mod tests {
                 large_edits: 0,
                 edit_events: 0.0,
                 navigation_events: 0.0,
+                terminal_activity_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 2,
@@ -2984,6 +3672,7 @@ mod tests {
             cursor_at_diagnostic: true,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         let prediction = classify(&state, None);
@@ -3030,6 +3719,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         for focused_pane in [FocusedPane::Terminal, FocusedPane::Editor] {
@@ -3069,6 +3759,198 @@ mod tests {
         }
     }
 
+    /// Terminal-engagement session, Part B: constructs a genuine *exact*
+    /// tie between Debugging and Implementing (cursor-at-diagnostic +
+    /// diagnostic-errors on one side, matching-magnitude edit-density on
+    /// the other — both landing on exactly 0.45 before normalization, with
+    /// nothing else contributing), then checks the tiebreaker only ever
+    /// moves the winner *toward* whichever pane is focused, never away
+    /// from it and never when neither pane is focused:
+    ///
+    /// - `FocusedPane::Other`: no pane to break the tie toward — priority
+    ///   order's own existing tie-break (Debugging over Implementing on an
+    ///   exact tie, unchanged from before this session) decides.
+    /// - `FocusedPane::Terminal`: favors Debugging, which already won by
+    ///   priority order — a no-op that still needs to leave Debugging
+    ///   winning (confirms the tiebreaker doesn't do anything destructive
+    ///   when it doesn't need to act).
+    /// - `FocusedPane::Editor`: favors Implementing, which *lost* the
+    ///   priority-order tie — this is the one case that actually requires
+    ///   the tiebreaker to override the winner for the test to pass.
+    #[test]
+    fn test_focus_tiebreaker_resolves_exact_tie_toward_focused_pane() {
+        let build = |focused_pane: FocusedPane| {
+            session_state_with(|state| {
+                state.pause_seconds = 15;
+                state.cursor_at_diagnostic = true;
+                state.diagnostics.errors = 1;
+                state.recent_actions.edit_events = 4.5;
+                state.focused_pane = focused_pane;
+            })
+        };
+
+        let other = classify(&build(FocusedPane::Other), None);
+        let terminal = classify(&build(FocusedPane::Terminal), None);
+        let editor = classify(&build(FocusedPane::Editor), None);
+        println!(
+            "tiebreaker exact-tie: other={:?}/{:.3} terminal={:?}/{:.3} editor={:?}/{:.3}",
+            other.intent, other.confidence, terminal.intent, terminal.confidence, editor.intent,
+            editor.confidence
+        );
+
+        assert_eq!(
+            other.intent,
+            DeveloperIntent::Debugging,
+            "no pane focused: priority order's existing Debugging-over-Implementing tie-break \
+            should decide, unaffected by the tiebreaker"
+        );
+        assert_eq!(
+            terminal.intent,
+            DeveloperIntent::Debugging,
+            "terminal focused: already matches the priority-order winner, should stay Debugging"
+        );
+        assert_eq!(
+            editor.intent,
+            DeveloperIntent::Implementing,
+            "editor focused: should override the priority-order tie-break, since Implementing \
+            is a genuine (exactly tied) runner-up"
+        );
+
+        // The contract this whole mechanism exists to preserve: whichever
+        // intent is selected, its own probability entry must be the
+        // argmax and must equal the reported confidence — see
+        // `apply_focus_tiebreaker`'s doc comment for why a swap has to
+        // update `probabilities` itself, not just the headline fields.
+        for prediction in [&other, &terminal, &editor] {
+            let selected_probability = prediction
+                .probabilities
+                .iter()
+                .find(|(intent, _)| *intent == prediction.intent)
+                .unwrap()
+                .1;
+            assert!(
+                (selected_probability - prediction.confidence).abs() < 1e-4,
+                "confidence must match the selected intent's own probability entry"
+            );
+            let max_probability = prediction
+                .probabilities
+                .iter()
+                .map(|(_, probability)| *probability)
+                .fold(f32::MIN, f32::max);
+            assert!(
+                selected_probability >= max_probability - 1e-4,
+                "selected intent must remain the argmax after any tiebreak swap"
+            );
+        }
+    }
+
+    /// Terminal-engagement session, Part B: a *clear* leader (well beyond
+    /// `FOCUS_TIE_MARGIN`) must never be overridden by pane focus, no
+    /// matter which pane is focused — the tiebreaker only arbitrates
+    /// genuine near-ties, not a runner-up that's simply present.
+    #[test]
+    fn test_focus_tiebreaker_never_overrides_a_clear_leader() {
+        let build = |focused_pane: FocusedPane| {
+            session_state_with(|state| {
+                state.pause_seconds = 15;
+                state.cursor_at_diagnostic = true;
+                state.diagnostics.errors = 1;
+                state.recent_actions.failed_test_runs = 1;
+                state.recent_actions.test_runs = 1;
+                // Implementing gets only a token signal, nowhere near
+                // Debugging's score.
+                state.recent_actions.edit_events = 2.0;
+                state.focused_pane = focused_pane;
+            })
+        };
+
+        for focused_pane in [FocusedPane::Other, FocusedPane::Terminal, FocusedPane::Editor] {
+            let prediction = classify(&build(focused_pane), None);
+            println!(
+                "clear-leader ({focused_pane:?}): intent={:?} confidence={:.3} \
+                probabilities={:?}",
+                prediction.intent, prediction.confidence, prediction.probabilities
+            );
+            let debugging_probability = prediction
+                .probabilities
+                .iter()
+                .find(|(intent, _)| *intent == DeveloperIntent::Debugging)
+                .unwrap()
+                .1;
+            let implementing_probability = prediction
+                .probabilities
+                .iter()
+                .find(|(intent, _)| *intent == DeveloperIntent::Implementing)
+                .unwrap()
+                .1;
+            assert!(
+                debugging_probability - implementing_probability > FOCUS_TIE_MARGIN,
+                "test construction check: this scenario must actually be a clear (non-near-tie) \
+                gap, got debugging={debugging_probability} implementing={implementing_probability}"
+            );
+            assert_eq!(
+                prediction.intent,
+                DeveloperIntent::Debugging,
+                "{focused_pane:?}: a clear Debugging leader must never be overridden by pane \
+                focus, even when the focused pane favors a different category"
+            );
+        }
+    }
+
+    /// Terminal-engagement session, Part B: probes both sides of
+    /// `FOCUS_TIE_MARGIN` directly, rather than only an exact tie (already
+    /// covered above) or a very wide gap. Debugging is pinned to 0.45
+    /// (cursor-at-diagnostic + one error, as in the exact-tie test);
+    /// Implementing's edit-density is tuned so its own probability lands a
+    /// controlled distance below that — close enough to trace through by
+    /// hand, since with both scores summing to well under `1.0 - floor`
+    /// here, normalization is a no-op (`total` is exactly `1.0`, so each
+    /// raw score already *is* its final probability — see the inline
+    /// comment at each case for the arithmetic).
+    #[test]
+    fn test_focus_tiebreaker_respects_the_margin_boundary() {
+        let build = |edit_events: f32, focused_pane: FocusedPane| {
+            session_state_with(|state| {
+                state.pause_seconds = 15;
+                state.cursor_at_diagnostic = true;
+                state.diagnostics.errors = 1;
+                state.recent_actions.edit_events = edit_events;
+                state.focused_pane = focused_pane;
+            })
+        };
+
+        // implementing_raw = WEIGHT_EDIT_DENSITY (0.30) +
+        // WEIGHT_EDIT_DENSITY_PER_EXTRA (0.06) * (4.0 - 2.0) = 0.42, a 0.03
+        // gap below Debugging's 0.45 — inside FOCUS_TIE_MARGIN (0.05).
+        let within_margin = classify(&build(4.0, FocusedPane::Editor), None);
+        println!(
+            "margin boundary (within, gap≈0.03): intent={:?} confidence={:.3} \
+            probabilities={:?}",
+            within_margin.intent, within_margin.confidence, within_margin.probabilities
+        );
+        assert_eq!(
+            within_margin.intent,
+            DeveloperIntent::Implementing,
+            "a ~0.03 gap is within FOCUS_TIE_MARGIN (0.05) — editor focus should flip the \
+            winner to the near-tied runner-up"
+        );
+
+        // implementing_raw = 0.30 + 0.06 * (3.1667 - 2.0) ≈ 0.37, a ~0.08
+        // gap below Debugging's 0.45 — outside FOCUS_TIE_MARGIN.
+        let beyond_margin = classify(&build(3.1667, FocusedPane::Editor), None);
+        println!(
+            "margin boundary (beyond, gap≈0.08): intent={:?} confidence={:.3} \
+            probabilities={:?}",
+            beyond_margin.intent, beyond_margin.confidence, beyond_margin.probabilities
+        );
+        assert_eq!(
+            beyond_margin.intent,
+            DeveloperIntent::Debugging,
+            "a ~0.08 gap is outside FOCUS_TIE_MARGIN (0.05) — editor focus should not flip the \
+            winner, even though Implementing is still the runner-up"
+        );
+    }
+
     /// Part C, diagnostic-location correlation: cursor at a known error
     /// line should score meaningfully higher Debugging than the same error
     /// present but the cursor elsewhere — confirming
@@ -3092,6 +3974,7 @@ mod tests {
             cursor_at_diagnostic: false,
             test_command_running: false,
             test_command_recently_passed: false,
+            focused_terminal_last_command: None,
         };
 
         let elsewhere = classify(&base, None);
@@ -3172,8 +4055,9 @@ mod tests {
             _ => None,
         });
 
-        let round_tripped = round_tripped
-            .expect("the feedback line just written should round-trip back with a matching prediction_id");
+        let round_tripped = round_tripped.expect(
+            "the feedback line just written should round-trip back with a matching prediction_id",
+        );
         assert!(!round_tripped.correct);
         assert_eq!(
             round_tripped.actual_intent,
@@ -3221,6 +4105,12 @@ mod classify_stress_tests {
             // `classify_never_violates_its_own_contract` checks below.
             any::<f32>(),
             any::<f32>(),
+            // Terminal-engagement session: same full-range-f32 treatment as
+            // edit_events/navigation_events above, extended to the new
+            // decayed-density field — `terminal_engagement`'s own `>=`
+            // comparison against it needs the same NaN/Infinity/negative
+            // stress coverage.
+            any::<f32>(),
         )
             .prop_map(
                 |(
@@ -3231,6 +4121,7 @@ mod classify_stress_tests {
                     large_edits,
                     edit_events,
                     navigation_events,
+                    terminal_activity_events,
                 )| {
                     RecentActions {
                         test_runs,
@@ -3241,24 +4132,24 @@ mod classify_stress_tests {
                         // generated independently to check classify() is
                         // robust to a shape the real engine would never
                         // produce, not just shapes it would. Same reasoning
-                        // extends to edit_events/navigation_events below
-                        // (also generated independently of large_edits).
+                        // extends to edit_events/navigation_events/
+                        // terminal_activity_events below (also generated
+                        // independently of large_edits).
                         failed_test_runs,
                         saves,
                         file_switches,
                         large_edits,
                         edit_events,
                         navigation_events,
+                        terminal_activity_events,
                     }
                 },
             )
     }
 
     fn diagnostics_strategy() -> impl Strategy<Value = DiagnosticsSummary> {
-        (any::<usize>(), any::<usize>()).prop_map(|(errors, warnings)| DiagnosticsSummary {
-            errors,
-            warnings,
-        })
+        (any::<usize>(), any::<usize>())
+            .prop_map(|(errors, warnings)| DiagnosticsSummary { errors, warnings })
     }
 
     /// Occasionally generates a recognized-config-file path (exercising
@@ -3274,6 +4165,34 @@ mod classify_stress_tests {
         ]
     }
 
+    fn command_category_strategy() -> impl Strategy<Value = CommandCategory> {
+        prop_oneof![
+            Just(CommandCategory::Test),
+            Just(CommandCategory::Build),
+            Just(CommandCategory::Git),
+            Just(CommandCategory::Package),
+            Just(CommandCategory::Lint),
+            Just(CommandCategory::Other),
+        ]
+    }
+
+    /// Terminal-engagement session: `None` (no terminal focused, or nothing
+    /// completed in it yet) or a `Some` with an arbitrary category/exit
+    /// code — including exit codes outside the conventional 0-255 range,
+    /// same "stress shapes the real engine wouldn't produce" reasoning as
+    /// the rest of this stress module.
+    fn last_command_outcome_strategy() -> impl Strategy<Value = Option<LastCommandOutcome>> {
+        prop_oneof![
+            Just(None),
+            (command_category_strategy(), any::<i32>()).prop_map(|(category, exit_code)| {
+                Some(LastCommandOutcome {
+                    category,
+                    exit_code,
+                })
+            }),
+        ]
+    }
+
     fn session_state_strategy() -> impl Strategy<Value = SessionState> {
         (
             recent_actions_strategy(),
@@ -3285,6 +4204,7 @@ mod classify_stress_tests {
             any::<bool>(),
             any::<bool>(),
             active_files_strategy(),
+            last_command_outcome_strategy(),
         )
             .prop_map(
                 |(
@@ -3297,6 +4217,7 @@ mod classify_stress_tests {
                     test_command_running,
                     test_command_recently_passed,
                     active_files,
+                    focused_terminal_last_command,
                 )| {
                     SessionState {
                         active_files,
@@ -3310,6 +4231,7 @@ mod classify_stress_tests {
                         cursor_at_diagnostic,
                         test_command_running,
                         test_command_recently_passed,
+                        focused_terminal_last_command,
                     }
                 },
             )
