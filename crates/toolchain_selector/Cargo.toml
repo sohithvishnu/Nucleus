@@ -17,6 +17,7 @@ menu.workspace = true
 open_path_prompt.workspace = true
 picker.workspace = true
 project.workspace = true
+theme.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true

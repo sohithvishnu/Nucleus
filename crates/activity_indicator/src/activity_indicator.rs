@@ -671,13 +671,14 @@ impl Render for ActivityIndicator {
                         }
                     })
                     .label_size(LabelSize::Small)
+                    .color(Color::Custom(cx.theme().colors().status_bar_foreground))
                     .tab_index(0isize)
                     .map(|this| match content.icon {
                         ActivityIcon::LoadingSpinner => this.loading(true),
                         ActivityIcon::Icon(icon_name) => this.start_icon(
                             Icon::new(icon_name)
                                 .size(IconSize::Small)
-                                .color(Color::Muted),
+                                .color(Color::Custom(cx.theme().colors().status_bar_foreground)),
                         ),
                     })
                     .map(|button| {

@@ -149,6 +149,7 @@ pub(crate) fn zed_default_dark() -> Theme {
                 icon_accent: blue,
                 debugger_accent: red,
                 status_bar_background: bg,
+                status_bar_foreground: hsla(222.9 / 360., 9.9 / 100., 86.1 / 100., 1.0),
                 title_bar_background: bg,
                 title_bar_inactive_background: bg,
                 toolbar_background: editor,

@@ -3,9 +3,10 @@ use gpui::{App, Entity, FocusHandle, Focusable, Styled, Subscription, Task, Weak
 use settings::{RegisterSetting, Settings};
 use std::{fmt::Write, num::NonZeroU32, time::Duration};
 use text::{Point, Selection};
+use theme::ActiveTheme;
 use ui::{
-    Button, ButtonCommon, Clickable, Context, FluentBuilder, IntoElement, LabelSize, ParentElement,
-    Render, Tooltip, Window, div,
+    Button, ButtonCommon, Clickable, Color, Context, FluentBuilder, IntoElement, LabelSize,
+    ParentElement, Render, Tooltip, Window, div,
 };
 use util::paths::FILE_ROW_COLUMN_DELIMITER;
 use workspace::{HideStatusItem, StatusBarSettings, StatusItemView, Workspace, item::ItemHandle};
@@ -225,6 +226,7 @@ impl Render for CursorPosition {
             el.child(
                 Button::new("go-to-line-column", text)
                     .label_size(LabelSize::Small)
+                    .color(Color::Custom(cx.theme().colors().status_bar_foreground))
                     .tab_index(0isize)
                     .aria_label(format!(
                         "Line {}, column {}",

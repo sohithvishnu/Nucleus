@@ -651,9 +651,13 @@ impl Render for MergeConflictIndicator {
                             .child(
                                 Icon::new(IconName::GitMergeConflict)
                                     .size(IconSize::Small)
-                                    .color(Color::Muted),
+                                    .color(Color::Custom(cx.theme().colors().status_bar_foreground)),
                             )
-                            .child(Label::new(message).size(LabelSize::Small)),
+                            .child(
+                                Label::new(message)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Custom(cx.theme().colors().status_bar_foreground)),
+                            ),
                     )
                     .tooltip(move |_, cx| {
                         Tooltip::with_meta(

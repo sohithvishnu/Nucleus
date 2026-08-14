@@ -30,6 +30,7 @@ impl Render for SearchButton {
         button.child(
             IconButton::new("project-search-indicator", SEARCH_ICON)
                 .icon_size(IconSize::Small)
+                .icon_color(Color::Custom(cx.theme().colors().status_bar_foreground))
                 .tab_index(0isize)
                 .aria_label("Project Search")
                 .tooltip(move |_window, cx| {

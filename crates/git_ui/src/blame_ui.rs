@@ -79,10 +79,11 @@ impl Render for GitBlameStatus {
             el.child(
                 Button::new("git-blame-status", text.clone())
                     .label_size(LabelSize::Small)
+                    .color(Color::Custom(cx.theme().colors().status_bar_foreground))
                     .start_icon(
                         Icon::new(IconName::FileGit)
                             .size(IconSize::Small)
-                            .color(Color::Hint),
+                            .color(Color::Custom(cx.theme().colors().status_bar_foreground)),
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(editor) = this.active_editor.clone() {

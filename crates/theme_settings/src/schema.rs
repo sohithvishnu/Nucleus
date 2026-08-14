@@ -440,6 +440,10 @@ pub fn theme_colors_refinement(
             .status_bar_background
             .as_ref()
             .and_then(|color| try_parse_color(color).ok()),
+        status_bar_foreground: this
+            .status_bar_foreground
+            .as_ref()
+            .and_then(|color| try_parse_color(color).ok()),
         title_bar_background: this
             .title_bar_background
             .as_ref()

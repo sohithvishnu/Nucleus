@@ -5,7 +5,8 @@ use gpui::{
 };
 use language::LanguageName;
 use settings::Settings as _;
-use ui::{Button, ButtonCommon, Clickable, FluentBuilder, LabelSize, Tooltip};
+use theme::ActiveTheme;
+use ui::{Button, ButtonCommon, Clickable, Color, FluentBuilder, LabelSize, Tooltip};
 use workspace::{HideStatusItem, StatusBarSettings, StatusItemView, Workspace, item::ItemHandle};
 
 use crate::{LanguageSelector, Toggle};
@@ -55,6 +56,7 @@ impl Render for ActiveBufferLanguage {
             el.child(
                 Button::new("change-language", active_language_text.clone())
                     .label_size(LabelSize::Small)
+                    .color(Color::Custom(cx.theme().colors().status_bar_foreground))
                     .tab_index(0isize)
                     .aria_label(format!("Language: {active_language_text}"))
                     .on_click(cx.listener(|this, _, window, cx| {

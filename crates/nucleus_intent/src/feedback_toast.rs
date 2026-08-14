@@ -19,11 +19,17 @@ use workspace::{ToastAction, ToastView};
 use crate::{DeveloperIntent, Feedback, NucleusLogger, PredictionId};
 
 /// The intents a user can pick from when correcting a prediction — only the
-/// ones with real classifier logic. Offering the 7 still-stubbed intents
-/// (always scored 0, never actually predicted) would be misleading.
-const CORRECTABLE_INTENTS: [DeveloperIntent; 4] = [
+/// ones with real classifier logic. Offering the 4 still-stubbed intents
+/// (Refactoring, Reviewing, Documenting, Planning — always scored 0, never
+/// actually predicted) would be misleading. Testing/Exploring/Configuring
+/// joined the real-logic set in the classifier-expansion session (Parts
+/// B/C/D) — see `nucleus.rs`'s `classify` doc comment.
+const CORRECTABLE_INTENTS: [DeveloperIntent; 7] = [
     DeveloperIntent::Debugging,
     DeveloperIntent::Implementing,
+    DeveloperIntent::Testing,
+    DeveloperIntent::Exploring,
+    DeveloperIntent::Configuring,
     DeveloperIntent::Idle,
     DeveloperIntent::ConsultingAgent,
 ];

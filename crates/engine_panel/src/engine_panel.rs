@@ -4,6 +4,7 @@ use gpui::{
     IntoElement, ParentElement, Pixels, Render, Styled, WeakEntity, Window, div, px,
 };
 use nucleus_intent::{FeedbackNudgeToast, LogEntry, NucleusEngine, NucleusEvent, RawEvent};
+use ui::CopyButton;
 use ui::ProgressBar;
 use ui::prelude::*;
 use workspace::{
@@ -234,6 +235,7 @@ impl EnginePanel {
                         .gap_1()
                         .children(prediction.evidence.iter().map(|evidence| {
                             h_flex()
+                                .items_start()
                                 .gap_1()
                                 .child(
                                     Label::new("›")
@@ -241,9 +243,11 @@ impl EnginePanel {
                                         .color(Color::Accent),
                                 )
                                 .child(
-                                    Label::new(evidence.clone())
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
+                                    div().flex_1().min_w_0().child(
+                                        Label::new(evidence.clone())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
                                 )
                         })),
                 ),
@@ -378,33 +382,54 @@ impl EnginePanel {
             );
 
         let filter = self.log_view.filter();
+        let visible_lines = self.log_view.visible_lines();
+        let visible_count = visible_lines.len();
+        let copy_all_text = visible_lines
+            .into_iter()
+            .map(|(_, entry)| format_log_entry_for_clipboard(entry))
+            .collect::<Vec<_>>()
+            .join("\n");
         let filter_row = h_flex()
-            .gap_1()
+            .justify_between()
             .px_4()
             .pt_2()
             .child(
-                Button::new("engine_log_filter_all", "All")
-                    .label_size(LabelSize::Small)
-                    .toggle_state(filter == LogTypeFilter::All)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_log_filter(LogTypeFilter::All, cx);
-                    })),
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("engine_log_filter_all", "All")
+                            .label_size(LabelSize::Small)
+                            .toggle_state(filter == LogTypeFilter::All)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_log_filter(LogTypeFilter::All, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("engine_log_filter_predictions", "Predictions")
+                            .label_size(LabelSize::Small)
+                            .toggle_state(filter == LogTypeFilter::Predictions)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_log_filter(LogTypeFilter::Predictions, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("engine_log_filter_raw", "Raw events")
+                            .label_size(LabelSize::Small)
+                            .toggle_state(filter == LogTypeFilter::RawEvents)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_log_filter(LogTypeFilter::RawEvents, cx);
+                            })),
+                    ),
             )
             .child(
-                Button::new("engine_log_filter_predictions", "Predictions")
-                    .label_size(LabelSize::Small)
-                    .toggle_state(filter == LogTypeFilter::Predictions)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_log_filter(LogTypeFilter::Predictions, cx);
-                    })),
-            )
-            .child(
-                Button::new("engine_log_filter_raw", "Raw events")
-                    .label_size(LabelSize::Small)
-                    .toggle_state(filter == LogTypeFilter::RawEvents)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_log_filter(LogTypeFilter::RawEvents, cx);
-                    })),
+                // Copies exactly what's on screen right now — the same
+                // filtered, mode-scoped `visible_lines()` the rows below are
+                // rendered from, so this always matches the active
+                // Live/History mode and All/Predictions/Raw-events filter.
+                CopyButton::new("engine_log_copy_all", copy_all_text)
+                    .icon_size(IconSize::Small)
+                    .tooltip_label("Copy all visible")
+                    .disabled(visible_count == 0),
             );
 
         let date_row = (mode == LogViewMode::History).then(|| {
@@ -549,9 +574,21 @@ impl EnginePanel {
                             ),
                     )
                     .child(
-                        Label::new(if is_expanded { "▾" } else { "▸" })
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                CopyButton::new(
+                                    ("engine_log_row_copy", index as u64),
+                                    format_log_entry_for_clipboard(entry),
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip_label("Copy entry"),
+                            )
+                            .child(
+                                Label::new(if is_expanded { "▾" } else { "▸" })
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
                     ),
             )
             .child(Label::new(summary).size(LabelSize::Small))
@@ -742,6 +779,16 @@ fn summarize_log_entry(entry: &LogEntry) -> (&'static str, String, Color) {
             ("feedback", summary, Color::Warning)
         }
     }
+}
+
+/// Plain-text, single-line rendering of a log entry for the clipboard.
+/// Reuses `summarize_log_entry`'s badge/summary computation — the same
+/// values already rendered in `render_log_row` — rather than a second
+/// formatter that could drift out of sync with what's on screen.
+fn format_log_entry_for_clipboard(entry: &LogEntry) -> String {
+    let time = entry.timestamp().format("%H:%M:%S").to_string();
+    let (badge, summary, _) = summarize_log_entry(entry);
+    format!("[{time}] {badge}: {summary}")
 }
 
 fn file_label(file: Option<&std::path::Path>) -> String {

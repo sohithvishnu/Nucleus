@@ -101,6 +101,7 @@ impl Render for ModeIndicator {
 
         let theme = cx.theme();
         let colors = theme.colors();
+        let status_bar_foreground = colors.status_bar_foreground;
         let system_transparent = gpui::hsla(0.0, 0.0, 0.0, 0.0);
         let vim_mode_text = match mode {
             crate::state::Mode::Normal => colors.vim_normal_foreground,
@@ -151,7 +152,8 @@ impl Render for ModeIndicator {
                 el.child(
                     Label::new(label)
                         .line_height_style(LineHeightStyle::UiLabel)
-                        .weight(FontWeight::MEDIUM),
+                        .weight(FontWeight::MEDIUM)
+                        .color(Color::Custom(status_bar_foreground)),
                 )
             })
             .when_some(mode, |el, mode| {

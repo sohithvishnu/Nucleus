@@ -77,7 +77,11 @@ impl Render for ImageInfo {
             .to_string(),
         );
 
-        div().child(Label::new(components.join(" • ")).size(LabelSize::Small))
+        div().child(
+            Label::new(components.join(" • "))
+                .size(LabelSize::Small)
+                .color(Color::Custom(cx.theme().colors().status_bar_foreground)),
+        )
     }
 }
 

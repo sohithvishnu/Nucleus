@@ -693,6 +693,15 @@ pub struct ThemeColorsContent {
     #[serde(rename = "status_bar.background")]
     pub status_bar_background: Option<String>,
 
+    /// Text/icon color for items in the status bar. Falls back to the
+    /// theme's general `text`/`icon` color when unset, so this only needs
+    /// to be specified by a theme whose status bar background doesn't pair
+    /// well with that general color (e.g. a colored/branded status bar that
+    /// keeps the same foreground across both a theme's light and dark
+    /// variants).
+    #[serde(rename = "status_bar.foreground")]
+    pub status_bar_foreground: Option<String>,
+
     #[serde(rename = "title_bar.background")]
     pub title_bar_background: Option<String>,
 

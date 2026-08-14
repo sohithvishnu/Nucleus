@@ -37,7 +37,7 @@ impl Render for DiagnosticIndicator {
             (0, 0) => h_flex().child(
                 Icon::new(IconName::Check)
                     .size(IconSize::Small)
-                    .color(Color::Default),
+                    .color(Color::Custom(cx.theme().colors().status_bar_foreground)),
             ),
             (error_count, warning_count) => h_flex()
                 .gap_1()
@@ -47,7 +47,11 @@ impl Render for DiagnosticIndicator {
                             .size(IconSize::Small)
                             .color(Color::Error),
                     )
-                    .child(Label::new(error_count.to_string()).size(LabelSize::Small))
+                    .child(
+                        Label::new(error_count.to_string())
+                            .size(LabelSize::Small)
+                            .color(Color::Custom(cx.theme().colors().status_bar_foreground)),
+                    )
                 })
                 .when(warning_count > 0, |this| {
                     this.child(
@@ -55,7 +59,11 @@ impl Render for DiagnosticIndicator {
                             .size(IconSize::Small)
                             .color(Color::Warning),
                     )
-                    .child(Label::new(warning_count.to_string()).size(LabelSize::Small))
+                    .child(
+                        Label::new(warning_count.to_string())
+                            .size(LabelSize::Small)
+                            .color(Color::Custom(cx.theme().colors().status_bar_foreground)),
+                    )
                 }),
         };
 
@@ -73,6 +81,7 @@ impl Render for DiagnosticIndicator {
             Some(
                 Button::new("diagnostic_message", SharedString::new(message))
                     .label_size(LabelSize::Small)
+                    .color(Color::Custom(cx.theme().colors().status_bar_foreground))
                     .truncate(true)
                     .tab_index(0isize)
                     .tooltip(move |_window, cx| {

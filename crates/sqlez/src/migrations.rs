@@ -12,6 +12,30 @@ use libsqlite3_sys::sqlite3_exec;
 
 use crate::connection::Connection;
 
+/// Whether `error` (from executing `migration`) is SQLite's "duplicate
+/// column name" failure for an `ADD COLUMN` step specifically. That failure
+/// is unambiguous — it can only mean the column this exact statement adds
+/// already exists — so unlike other migration failures it's safe to treat
+/// as "already applied" rather than a hard error. This can happen when a
+/// table was created (or altered) by an earlier version of the code whose
+/// migration bookkeeping doesn't match the current one (e.g. the migration
+/// text or step count changed upstream, or the underlying schema was
+/// produced outside this migration run entirely) — without this tolerance
+/// the failure is permanent: the whole per-domain migration loop runs in a
+/// single `SAVEPOINT` (see `migrate` below), so the error rolls back even
+/// this call's own successfully-completed steps, reproducing the exact same
+/// failure on every subsequent launch.
+fn is_already_applied_add_column(migration: &str, error: &anyhow::Error) -> bool {
+    // `migration` here is post-`sqlformat`, which can put "ADD" and "COLUMN"
+    // on separate lines — compare on whitespace-normalized text so that
+    // reformatting can't defeat this check.
+    let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.to_ascii_uppercase().contains("ADD COLUMN")
+        && error
+            .chain()
+            .any(|cause| cause.to_string().contains("duplicate column name"))
+}
+
 impl Connection {
     fn eager_exec(&self, sql: &str) -> anyhow::Result<()> {
         let sql_str = CString::new(sql).context("Error creating cstr")?;
@@ -89,7 +113,15 @@ impl Connection {
                     }
                 }
 
-                self.eager_exec(&migration)?;
+                if let Err(error) = self.eager_exec(&migration) {
+                    if !is_already_applied_add_column(&migration, &error) {
+                        return Err(error);
+                    }
+                    log::warn!(
+                        "treating migration as already applied for {domain} at step {index}, \
+                         since its column already exists on disk: {error}"
+                    );
+                }
                 did_migrate = true;
                 store_completed_migration((domain, index, migration))?;
             }
@@ -382,6 +414,78 @@ mod test {
         let res = &connection.select::<String>("SELECT b FROM table1").unwrap()().unwrap()[0];
 
         assert_eq!(res, "test text");
+    }
+
+    /// Reproduces the "duplicate column name" crash loop: a column already
+    /// exists on the table (simulating an earlier, differently-tracked
+    /// migration run having added it) while this domain's own migration
+    /// bookkeeping has no record of that step. Without the tolerance in
+    /// `is_already_applied_add_column`, this would `bail!` and, per
+    /// `with_savepoint`'s rollback-on-error behavior, roll back the whole
+    /// call — including the `CREATE TABLE` step that just genuinely
+    /// succeeded — reproducing the identical failure on every retry.
+    #[test]
+    fn migration_tolerates_column_that_already_exists() {
+        let connection = Connection::open_memory(Some("migration_tolerates_existing_column"));
+
+        // Simulate the column already existing on disk, outside of this
+        // domain's migration tracking.
+        connection
+            .exec(indoc! {"
+                CREATE TABLE widgets (
+                    id INTEGER,
+                    extra TEXT
+                );"})
+            .unwrap()()
+        .unwrap();
+
+        let result = connection.migrate(
+            "widgets_domain",
+            &[
+                "CREATE TABLE IF NOT EXISTS widgets (id INTEGER)",
+                "ALTER TABLE widgets ADD COLUMN extra TEXT",
+            ],
+            &mut disallow_migration_change,
+        );
+        assert!(result.is_ok(), "migration should self-heal: {result:?}");
+
+        let completed_steps = connection
+            .select::<String>("SELECT migration FROM migrations WHERE domain = 'widgets_domain'")
+            .unwrap()()
+        .unwrap();
+        assert_eq!(
+            completed_steps.len(),
+            2,
+            "both steps should be recorded as completed, not rolled back"
+        );
+
+        // A second run must be a clean no-op (both steps already recorded),
+        // not a repeat of the same failure.
+        connection
+            .migrate(
+                "widgets_domain",
+                &[
+                    "CREATE TABLE IF NOT EXISTS widgets (id INTEGER)",
+                    "ALTER TABLE widgets ADD COLUMN extra TEXT",
+                ],
+                &mut disallow_migration_change,
+            )
+            .unwrap();
+    }
+
+    /// A genuinely unrelated failure in an `ADD COLUMN` statement (not a
+    /// duplicate-column error) must still fail loudly rather than being
+    /// swallowed by the same tolerance.
+    #[test]
+    fn migration_still_fails_for_other_add_column_errors() {
+        let connection = Connection::open_memory(Some("migration_other_add_column_errors"));
+
+        let result = connection.migrate(
+            "widgets_domain_2",
+            &["ALTER TABLE nonexistent_table ADD COLUMN extra TEXT"],
+            &mut disallow_migration_change,
+        );
+        assert!(result.is_err());
     }
 
     fn disallow_migration_change(_: usize, _: &str, _: &str) -> bool {

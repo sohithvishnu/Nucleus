@@ -42,6 +42,7 @@ impl Render for ActiveFileName {
             .child(
                 Button::new("active-file-name-button", project_path)
                     .label_size(LabelSize::Small)
+                    .color(Color::Custom(cx.theme().colors().status_bar_foreground))
                     .tooltip(Tooltip::text(tooltip_text)),
             )
             .into_any_element()

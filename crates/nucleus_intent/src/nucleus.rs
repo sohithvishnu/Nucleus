@@ -60,17 +60,77 @@ const MAX_ACTIVE_FILES: usize = 5;
 /// large-edit signal so both agree on one definition.
 const LARGE_EDIT_THRESHOLD: usize = 40;
 
-/// How far back to look for *recurring* large edits (see
-/// `RecentActions::large_edits`) — deliberately much shorter than
-/// `RECENT_WINDOW`: this is specifically about detecting a live burst of
-/// edits, not "one happened sometime in the last five minutes."
-const EDIT_BURST_WINDOW: Duration = Duration::from_secs(30);
+/// How far back to look for *recent, burst-like* activity — deliberately
+/// much shorter than `RECENT_WINDOW`: this is specifically about detecting
+/// something happening live right now, not "sometime in the last five
+/// minutes." Scoped to recurring large edits (`RecentActions::large_edits`)
+/// and `SessionState::test_command_recently_passed` (Part B) — both still a
+/// plain hard-cutoff rolling window, unlike the two Part A density signals
+/// below, which deliberately replace a hard cutoff with continuous decay
+/// (see `DENSITY_DECAY_TIME_CONSTANT_SECS`) specifically to avoid the
+/// artificial cliff a window boundary creates. Kept as a hard window here
+/// because neither of *these* two signals has that cliff problem in
+/// practice: a large-edit burst and a passing test are each already
+/// individually meaningful events (not "many small things add up"), so
+/// there's no thin, easily-misjudged case at the boundary the way there is
+/// for "was there enough recent typing" — see `classify`'s doc comment for
+/// the fuller reasoning.
+const ACTIVITY_BURST_WINDOW: Duration = Duration::from_secs(30);
+
+/// Part A (classifier-expansion, decay revision): the time constant for
+/// the exponential recency decay backing the edit-density and
+/// navigation-density signals, replacing this session's earlier
+/// hard-rolling-window design. Inspired by Eclipse Mylyn's
+/// Degree-of-Interest model — each interaction contributes decaying
+/// "interest" rather than mattering fully inside a window and not at all
+/// outside it, avoiding the artificial cliff a hard cutoff creates (an
+/// edit at t-29s counting fully, one at t-31s counting zero, even though
+/// nothing meaningfully changed between them). A single event's
+/// contribution is `exp(-age_seconds / DENSITY_DECAY_TIME_CONSTANT_SECS)`:
+/// 1.0 the instant it happens, ~0.37 (1/e) after 15s, ~0.14 after 30s,
+/// ~0.007 after 75s (see `DENSITY_RETENTION_WINDOW`). 15s was chosen to
+/// land in the same "tens of seconds" scale the rest of this file already
+/// uses for burst-like signals (`ACTIVITY_BURST_WINDOW` = 30s = 2 time
+/// constants) — dense continuous typing (an edit every 1-3s, the
+/// motivating log's own cadence) accumulates a decayed sum in the
+/// high-single-digits within this timescale, a similar order of magnitude
+/// to the old hard-count design's cap, without the cliff.
+const DENSITY_DECAY_TIME_CONSTANT_SECS: f32 = 15.0;
+
+/// How long a timestamp is kept in memory at all before being pruned,
+/// purely for bookkeeping hygiene — *not* the scoring boundary (scoring is
+/// the continuous decay above, which is why this can be generous: five
+/// time constants, past which a single event's contribution is ~0.007,
+/// negligible against the thresholds below regardless of whether it's kept
+/// or dropped).
+const DENSITY_RETENTION_WINDOW: Duration = Duration::from_secs(75);
+
+/// Sums each `timestamps` entry's exponentially-decayed contribution as of
+/// `now` — the actual Part A recency-and-frequency weighting. Called from
+/// `NucleusEngine::refresh` (which has a real wall-clock `now`) to produce
+/// the plain `f32` that goes into `RecentActions::{edit_events,
+/// navigation_events}`; `classify` itself only ever sees that already-computed
+/// number, never wall-clock time, so it stays a pure, deterministic function
+/// of its `SessionState` argument (see `classify_is_deterministic_for_identical_input`).
+/// Callers are expected to have already pruned `timestamps` to
+/// `DENSITY_RETENTION_WINDOW` (this function doesn't re-check that itself —
+/// it would just contribute a negligible amount for anything beyond it
+/// anyway).
+fn decayed_density(timestamps: &VecDeque<Instant>, now: Instant) -> f32 {
+    timestamps
+        .iter()
+        .map(|at| {
+            let age_secs = now.saturating_duration_since(*at).as_secs_f32();
+            (-age_secs / DENSITY_DECAY_TIME_CONSTANT_SECS).exp()
+        })
+        .sum()
+}
 
 /// How often the feedback nudge (Part A) is allowed to fire. Deliberately
 /// low-frequency and mid-range within the requested 10-15 minute window: an
 /// interruption tool whose own tooling interrupts often would undermine the
 /// thing it's trying to reduce. 12 minutes doesn't line up with any other
-/// timer here (`PRUNE_INTERVAL`, `EDIT_BURST_WINDOW`), which is deliberate —
+/// timer here (`PRUNE_INTERVAL`, `ACTIVITY_BURST_WINDOW`), which is deliberate —
 /// it should read as independent of session activity, not synchronized to it.
 const FEEDBACK_NUDGE_INTERVAL: Duration = Duration::from_secs(12 * 60);
 
@@ -88,6 +148,18 @@ const DIAGNOSTIC_LOCATION_LINE_WINDOW: u32 = 2;
 /// tuned against real usage yet.
 const CONFIDENCE_LOG_THRESHOLD: f32 = 0.1;
 
+/// Cross-checked (classifier-expansion session, Part E — validation only,
+/// no variants added) against WakaTime's heartbeat category taxonomy
+/// (coding, building, indexing, debugging, browsing, running tests, writing
+/// tests, manual testing, writing docs, communicating, code reviewing,
+/// notes, researching, learning, designing). Findings, in full, are in that
+/// session's report — briefly: `Debugging` matches cleanly; `Exploring`
+/// matches WakaTime's "browsing" in *name* but not fully in *signal*
+/// (WakaTime's is file-tree navigation, this crate's is in-buffer
+/// selection/cursor movement — see `classify`'s Part C doc comment);
+/// `Testing` matches WakaTime's "running tests" specifically, not its
+/// separate "writing tests"/"manual testing"; WakaTime's "building" and
+/// "indexing" have no equivalent variant here at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum DeveloperIntent {
     Debugging,
@@ -141,21 +213,46 @@ impl DeveloperIntent {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// No `Eq` (unlike most other plain-data structs in this file): the two
+/// decayed-density fields below are `f32`, which can't implement `Eq`
+/// (no total ordering — `NaN`). `PartialEq` (used by tests via `assert_eq!`)
+/// is unaffected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct RecentActions {
     pub test_runs: u32,
     pub failed_test_runs: u32,
     pub saves: u32,
     pub file_switches: u32,
     /// Large edits (>= [`LARGE_EDIT_THRESHOLD`] chars) within the last
-    /// [`EDIT_BURST_WINDOW`] — deliberately a much shorter, separate window
-    /// than the other fields above (which use the full `RECENT_WINDOW`):
-    /// this one exists specifically to tell "a burst of large edits is
-    /// happening right now" apart from "one happened sometime in the last
-    /// five minutes." `#[serde(default)]` so historical log lines written
-    /// before this field existed still parse.
+    /// [`ACTIVITY_BURST_WINDOW`] — deliberately a much shorter, separate
+    /// window than the other fields above (which use the full
+    /// `RECENT_WINDOW`): this one exists specifically to tell "a burst of
+    /// large edits is happening right now" apart from "one happened
+    /// sometime in the last five minutes." `#[serde(default)]` so
+    /// historical log lines written before this field existed still parse.
     #[serde(default)]
     pub large_edits: u32,
+    /// Activity-density signal (classifier-expansion session), Part A #1:
+    /// recency-and-frequency-decayed sum of edit events of *any* size (see
+    /// [`decayed_density`]/[`DENSITY_DECAY_TIME_CONSTANT_SECS`]) — a
+    /// continuous relative of `large_edits` above (every large edit
+    /// contributes here too, alongside every small one), not a superset in
+    /// the discrete-counting sense anymore. Exists because a normal editing
+    /// session is mostly small ~1-char edits punctuated by occasional
+    /// larger ones; `large_edits` alone can't see a dense run of small
+    /// edits as activity, which was the root cause of a real logged
+    /// false-Idle bug (continuous editing, no pause, still classified Idle
+    /// because no single edit ever cleared the "large" threshold). See
+    /// `classify`'s doc comment.
+    #[serde(default)]
+    pub edit_events: f32,
+    /// Activity-density signal, Part A #2: recency-and-frequency-decayed
+    /// sum of selection-changed (navigation) events. Feeds
+    /// `DeveloperIntent::Exploring` (Part C) — dense navigation with
+    /// little/no editing is a distinct real pattern (browsing code, jumping
+    /// between definitions) from both Implementing and Idle.
+    #[serde(default)]
+    pub navigation_events: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +297,22 @@ pub struct SessionState {
     /// alone (which only says an error exists somewhere in the file).
     #[serde(default)]
     pub cursor_at_diagnostic: bool,
+    /// Classifier-expansion session, Part B: whether a `test`-category
+    /// plain-terminal command (`terminal_watcher::CommandCategory::Test`,
+    /// Phase 4b-1) is currently in flight. Driven entirely by the
+    /// terminal-watcher's plain-terminal command tracking — deliberately
+    /// separate from `RecentActions::{test_runs,failed_test_runs}` (which
+    /// come from Zed's task runner only) so this can't dilute or be diluted
+    /// by that existing, unrelated data source. See `classify`'s doc
+    /// comment for the boundary with `DeveloperIntent::Debugging`.
+    #[serde(default)]
+    pub test_command_running: bool,
+    /// Classifier-expansion session, Part B: whether a `test`-category
+    /// plain-terminal command finished *successfully* (exit code 0) within
+    /// [`ACTIVITY_BURST_WINDOW`] — a passing run someone just watched
+    /// complete, not a stale one from minutes ago.
+    #[serde(default)]
+    pub test_command_recently_passed: bool,
 }
 
 /// Stable per-prediction identifier so a feedback response (Part A) can
@@ -275,8 +388,25 @@ pub struct NucleusEngine {
     save_timestamps: VecDeque<Instant>,
     file_switch_timestamps: VecDeque<Instant>,
     test_run_outcomes: VecDeque<(Instant, bool)>,
-    /// Backs `RecentActions::large_edits` — see `EDIT_BURST_WINDOW`.
+    /// Backs `RecentActions::large_edits` — see `ACTIVITY_BURST_WINDOW`.
     large_edit_timestamps: VecDeque<Instant>,
+    /// Backs `RecentActions::edit_events` (Part A #1) — raw timestamps of
+    /// every edit, regardless of size, unlike `large_edit_timestamps` above
+    /// which only tracks edits >= `LARGE_EDIT_THRESHOLD`. Pruned to
+    /// `DENSITY_RETENTION_WINDOW` (not `ACTIVITY_BURST_WINDOW` — this feeds
+    /// `decayed_density`, not a hard count), and only ever turned into the
+    /// actual decayed number at `refresh` time.
+    edit_timestamps: VecDeque<Instant>,
+    /// Backs `RecentActions::navigation_events` (Part A #2) — same
+    /// decay-at-`refresh`-time treatment as `edit_timestamps` above.
+    selection_timestamps: VecDeque<Instant>,
+    /// Backs `SessionState::test_command_recently_passed` (Part B) —
+    /// timestamps of `test`-category plain-terminal commands that finished
+    /// with exit code 0. Whether one is *currently* running is queried
+    /// directly from `terminal_watcher` instead (see
+    /// `TerminalCommandWatcher::has_pending_command_of_category`), so this
+    /// only needs to track the "just passed" recency case.
+    test_pass_timestamps: VecDeque<Instant>,
     last_activity_at: Instant,
 
     workspace: WeakEntity<Workspace>,
@@ -288,12 +418,12 @@ pub struct NucleusEngine {
     /// terminal" set would only ever count the first run in a reused tab.
     last_seen_task_status: HashMap<EntityId, terminal::TaskStatus>,
     /// Phase 4b-1: shell-hook injection + marker-driven command tracking for
-    /// plain (non-task) terminals — see `terminal_watcher`.
+    /// plain (non-task) terminals — see `terminal_watcher`. Markers are
+    /// written to a per-terminal file (not the terminal's own stdout), so
+    /// detection is polled alongside injection in `poll_plain_terminals`
+    /// rather than reactive to a GPUI event — no terminal subscription is
+    /// needed here at all.
     terminal_watcher: terminal_watcher::TerminalCommandWatcher,
-    /// One `Event::Wakeup` subscription per plain terminal currently being
-    /// watched, keyed by the terminal's `EntityId`. Pruned alongside
-    /// `terminal_watcher`'s own state in `poll_plain_terminals`.
-    _terminal_wakeup_subscriptions: HashMap<EntityId, Subscription>,
 
     logger: NucleusLogger,
     /// The last `IntentPrediction` actually written to the log, compared
@@ -394,11 +524,13 @@ impl NucleusEngine {
             file_switch_timestamps: VecDeque::new(),
             test_run_outcomes: VecDeque::new(),
             large_edit_timestamps: VecDeque::new(),
+            edit_timestamps: VecDeque::new(),
+            selection_timestamps: VecDeque::new(),
+            test_pass_timestamps: VecDeque::new(),
             last_activity_at: Instant::now(),
             workspace: weak_workspace,
             last_seen_task_status: HashMap::default(),
             terminal_watcher: terminal_watcher::TerminalCommandWatcher::new(),
-            _terminal_wakeup_subscriptions: HashMap::default(),
             logger,
             last_logged_prediction: None,
             window_handle,
@@ -496,6 +628,7 @@ impl NucleusEngine {
                             },
                             cx,
                         );
+                        this.selection_timestamps.push_back(Instant::now());
                         this.last_activity_at = Instant::now();
                         this.refresh(cx);
                     }
@@ -550,6 +683,7 @@ impl NucleusEngine {
         self.session_state.diff_summary = Some(format!(
             "{edit_count} edit(s), +{inserted}/-{deleted} chars in {file_label}"
         ));
+        self.edit_timestamps.push_back(Instant::now());
         if magnitude >= LARGE_EDIT_THRESHOLD {
             self.large_edit_timestamps.push_back(Instant::now());
         }
@@ -676,12 +810,15 @@ impl NucleusEngine {
     }
 
     /// Phase 4b-1: injects shell hooks into any plain (non-task) terminal
-    /// that hasn't already been injected, and keeps one `Event::Wakeup`
-    /// subscription per plain terminal alive for marker scanning (see
-    /// `handle_terminal_wakeup`). Runs on the same `PRUNE_INTERVAL` cadence
-    /// as `poll_task_terminals` for injection/pruning bookkeeping — the
-    /// actual marker *detection* is reactive to `Event::Wakeup`, not gated
-    /// on this poll interval.
+    /// that hasn't already been injected, then polls every live, injected
+    /// plain terminal's marker file for newly-appended command start/finish
+    /// markers (see `terminal_watcher::TerminalCommandWatcher::
+    /// poll_marker_file`) and records any outcomes found. Runs on the same
+    /// `PRUNE_INTERVAL` cadence as `poll_task_terminals` — detection latency
+    /// here is now up to one interval (was near-instant, reactive to
+    /// `Event::Wakeup`, before markers moved off the terminal's own stdout
+    /// to a dedicated file — see `terminal_watcher`'s module doc comment for
+    /// why), the same tradeoff already accepted for task-terminal detection.
     ///
     /// Gated on `terminal.task().is_none()` so this never observes the same
     /// terminals `poll_task_terminals` already covers. Not unit-tested
@@ -718,81 +855,109 @@ impl NucleusEngine {
                 }
                 let entity_id = terminal.entity_id();
                 live_ids.insert(entity_id);
-                if self.terminal_watcher.needs_injection(entity_id) {
-                    to_inject.push(terminal.clone());
+                if !self.terminal_watcher.needs_injection(entity_id) {
+                    continue;
                 }
+                // Wait one full poll tick after first noticing a terminal
+                // before injecting into it, so the shell's own startup (rc
+                // files, `conda init`, etc.) has time to finish — injecting
+                // immediately can race that startup and land input while the
+                // shell isn't ready to receive it.
+                if self.terminal_watcher.mark_observed(entity_id) {
+                    continue;
+                }
+                to_inject.push(terminal.clone());
             }
         }
 
         for terminal in to_inject {
             let entity_id = terminal.entity_id();
             let shell_kind = terminal.read(cx).shell_kind();
-            if let Some(script) = terminal_watcher::shell_hook_script(shell_kind) {
-                terminal.update(cx, |terminal, _cx| {
-                    terminal.write_program_input(script.as_bytes());
-                });
-                let subscription = cx.subscribe(&terminal, Self::handle_terminal_wakeup);
-                self._terminal_wakeup_subscriptions
-                    .insert(entity_id, subscription);
+            let Some(script) = terminal_watcher::shell_hook_script(shell_kind) else {
+                // Unsupported shell — mark injected anyway so we don't retry
+                // every poll tick for a shell we can't hook.
+                self.terminal_watcher.mark_injected(entity_id);
+                continue;
+            };
+
+            let script_path =
+                paths::temp_dir().join(format!("nucleus_hook_{}.sh", uuid::Uuid::new_v4()));
+            if let Err(error) = std::fs::write(&script_path, script) {
+                log::warn!("failed to write nucleus terminal hook script: {error}");
+                // Leave injection state as "observed but not injected" so
+                // this is retried on the next poll tick rather than skipped
+                // forever over a likely-transient I/O error.
+                continue;
             }
-            // Mark injected either way (including unsupported shells) so we
-            // don't retry every poll tick for a shell we can't hook.
+
+            let marker_path =
+                paths::temp_dir().join(format!("nucleus_markers_{}.log", uuid::Uuid::new_v4()));
+            self.terminal_watcher
+                .set_marker_file(entity_id, marker_path.clone());
+
+            let input =
+                terminal_watcher::hook_install_command(shell_kind, &script_path, &marker_path);
+            terminal.update(cx, |terminal, _cx| {
+                terminal.write_program_input(input);
+            });
             self.terminal_watcher.mark_injected(entity_id);
         }
 
         self.terminal_watcher.prune(&live_ids);
-        self._terminal_wakeup_subscriptions
-            .retain(|id, _| live_ids.contains(id));
+        self.poll_marker_files(&live_ids, cx);
     }
 
-    /// Reacts to `Event::Wakeup` (new PTY output) on a watched plain
-    /// terminal by scanning its most-recent lines for command start/finish
-    /// markers — see `terminal_watcher`'s module doc comment for why this
-    /// mirrors `crates/terminal`'s own `INIT_COMMAND_STARTUP_MARKER_*`
-    /// pattern instead of relying on OSC 133 (which doesn't exist in this
-    /// fork's terminal stack).
-    fn handle_terminal_wakeup(
-        this: &mut Self,
-        terminal: Entity<terminal::Terminal>,
-        event: &terminal::Event,
-        cx: &mut Context<Self>,
-    ) {
-        if !matches!(event, terminal::Event::Wakeup) {
-            return;
-        }
-        let entity_id = terminal.entity_id();
-        let lines = terminal
-            .read(cx)
-            .last_n_non_empty_lines(terminal_watcher::MARKER_SEARCH_LINES);
-        let outcomes = this.terminal_watcher.scan_lines(entity_id, &lines);
-        for outcome in outcomes {
-            match outcome {
-                terminal_watcher::TerminalCommandOutcome::Started { command } => {
-                    this.record_raw_event(
-                        RawEvent::TerminalCommandStarted {
-                            command: terminal_watcher::redact_command(&command),
-                        },
-                        cx,
-                    );
-                }
-                terminal_watcher::TerminalCommandOutcome::Finished {
-                    command,
-                    exit_code,
-                    duration,
-                } => {
-                    this.record_raw_event(
-                        RawEvent::TerminalCommandFinished {
-                            command: terminal_watcher::redact_command(&command),
-                            exit_code,
-                            duration_ms: duration.as_millis() as u64,
-                        },
-                        cx,
-                    );
+    /// Polls every currently-live plain terminal's marker file for
+    /// newly-appended command start/finish markers and records any
+    /// outcomes — the file-based replacement for the old
+    /// `Event::Wakeup`-reactive `handle_terminal_wakeup`. Terminals that
+    /// were never successfully injected (or whose shell isn't supported)
+    /// simply have no marker file yet; `poll_marker_file` treats that as
+    /// "nothing new," not an error.
+    fn poll_marker_files(&mut self, live_ids: &HashSet<EntityId>, cx: &mut Context<Self>) {
+        let mut any_outcome = false;
+        for &entity_id in live_ids {
+            for outcome in self.terminal_watcher.poll_marker_file(entity_id) {
+                any_outcome = true;
+                match outcome {
+                    terminal_watcher::TerminalCommandOutcome::Started { command } => {
+                        self.record_raw_event(
+                            RawEvent::TerminalCommandStarted {
+                                command: terminal_watcher::redact_command(&command),
+                            },
+                            cx,
+                        );
+                    }
+                    terminal_watcher::TerminalCommandOutcome::Finished {
+                        command,
+                        exit_code,
+                        duration,
+                    } => {
+                        // Categorize the pre-redaction command, matching
+                        // terminal_watcher's own documented convention (a
+                        // command name is never itself the secret-shaped
+                        // part `redact_command` targets — see
+                        // `categorize_command`'s doc comment).
+                        if categorize_command(&command) == CommandCategory::Test
+                            && exit_code == 0
+                        {
+                            self.test_pass_timestamps.push_back(Instant::now());
+                        }
+                        self.record_raw_event(
+                            RawEvent::TerminalCommandFinished {
+                                command: terminal_watcher::redact_command(&command),
+                                exit_code,
+                                duration_ms: duration.as_millis() as u64,
+                            },
+                            cx,
+                        );
+                    }
                 }
             }
         }
-        this.last_activity_at = Instant::now();
-        this.refresh(cx);
+        if any_outcome {
+            self.last_activity_at = Instant::now();
+        }
     }
 
     /// Runs every `PRUNE_INTERVAL`. Also where the window-scoped Part B/C
@@ -807,8 +972,16 @@ impl NucleusEngine {
         self.save_timestamps.retain(|at| *at >= cutoff);
         self.file_switch_timestamps.retain(|at| *at >= cutoff);
         self.test_run_outcomes.retain(|(at, _)| *at >= cutoff);
-        let burst_cutoff = now.checked_sub(EDIT_BURST_WINDOW).unwrap_or(now);
+        let burst_cutoff = now.checked_sub(ACTIVITY_BURST_WINDOW).unwrap_or(now);
         self.large_edit_timestamps.retain(|at| *at >= burst_cutoff);
+        self.test_pass_timestamps.retain(|at| *at >= burst_cutoff);
+        // Density-decay signals (Part A) use a much more generous retention
+        // cutoff than the hard-window signals above — see
+        // `DENSITY_RETENTION_WINDOW`'s doc comment for why that's fine
+        // (this is bookkeeping hygiene, not the scoring boundary).
+        let density_cutoff = now.checked_sub(DENSITY_RETENTION_WINDOW).unwrap_or(now);
+        self.edit_timestamps.retain(|at| *at >= density_cutoff);
+        self.selection_timestamps.retain(|at| *at >= density_cutoff);
         self.poll_task_terminals(cx);
         self.poll_plain_terminals(cx);
         self.session_state.agent_active = self.compute_agent_active(window, cx);
@@ -912,8 +1085,9 @@ impl NucleusEngine {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
         self.session_state.active_files = self.recent_files.clone();
-        self.session_state.pause_seconds = Instant::now()
+        self.session_state.pause_seconds = now
             .saturating_duration_since(self.last_activity_at)
             .as_secs();
         self.session_state.current_symbol = self.current_symbol(cx);
@@ -927,7 +1101,13 @@ impl NucleusEngine {
                 .filter(|(_, success)| !success)
                 .count() as u32,
             large_edits: self.large_edit_timestamps.len() as u32,
+            edit_events: decayed_density(&self.edit_timestamps, now),
+            navigation_events: decayed_density(&self.selection_timestamps, now),
         };
+        self.session_state.test_command_running = self
+            .terminal_watcher
+            .has_pending_command_of_category(CommandCategory::Test);
+        self.session_state.test_command_recently_passed = !self.test_pass_timestamps.is_empty();
 
         let new_prediction = classify(&self.session_state, self.last_edit_magnitude);
         if self.is_meaningful_prediction_change(&new_prediction) {
@@ -998,7 +1178,7 @@ const WEIGHT_LARGE_EDIT: f32 = 0.25;
 const WEIGHT_PASSING_TESTS: f32 = 0.15;
 const WEIGHT_CONTINUOUS_ACTIVITY: f32 = 0.10;
 /// Bonus per *additional* large edit beyond the first within
-/// `EDIT_BURST_WINDOW` — i.e. a lone large edit earns only
+/// `ACTIVITY_BURST_WINDOW` — i.e. a lone large edit earns only
 /// [`WEIGHT_LARGE_EDIT`], same as before this signal existed; a genuine
 /// sustained burst (2nd, 3rd, ... recurrence) earns this on top, each time.
 /// See [`classify`]'s doc comment for the bug this fixes.
@@ -1020,6 +1200,129 @@ const WEIGHT_EDITOR_FOCUS: f32 = 0.08;
 /// pointed" is close to unambiguous, versus "there's an error somewhere in
 /// this file."
 const WEIGHT_CURSOR_AT_DIAGNOSTIC: f32 = 0.30;
+
+// ---- Classifier-expansion session: Part A (activity-density), Part B
+// (Testing), Part C (Exploring), Part D (Configuring). See `classify`'s doc
+// comment for how these fit together and interact with the scoring above. ----
+
+/// Part A #1 (edit-density): base contribution once the decayed sum
+/// [`RecentActions::edit_events`] reaches [`MIN_EDIT_DENSITY_FOR_SIGNAL`] —
+/// deliberately requiring more than a single fresh edit's own ~1.0
+/// contribution, so a single small edit alone still doesn't count as
+/// "active work" (that was the whole point of [`WEIGHT_SMALL_EDIT`] being
+/// small on its own). Comparable in magnitude to [`WEIGHT_LARGE_EDIT`]
+/// since both describe the same underlying thing (real, ongoing editing)
+/// through a different lens (frequency vs. size) — see [`classify`]'s doc
+/// comment for why both are allowed to contribute without either being
+/// double-counted.
+const WEIGHT_EDIT_DENSITY: f32 = 0.30;
+/// Bonus per unit of decayed density beyond [`MIN_EDIT_DENSITY_FOR_SIGNAL`],
+/// up to [`MAX_EDIT_DENSITY_COUNTED`] — same diminishing-returns shape as
+/// [`WEIGHT_EDIT_BURST_EACH_EXTRA`], just continuous instead of per-integer-
+/// count now that the underlying signal is a decayed sum, not a count.
+const WEIGHT_EDIT_DENSITY_PER_EXTRA: f32 = 0.06;
+/// A lone, just-happened edit contributes almost exactly 1.0 to the decayed
+/// sum (`exp(-0/15) = 1.0`); requiring at least 2.0 means it takes at least
+/// two edits close together in time (or several a bit further apart) to
+/// clear this — never a single edit, no matter how fresh.
+const MIN_EDIT_DENSITY_FOR_SIGNAL: f32 = 2.0;
+/// Cap on how much decayed density keeps adding bonus — continuous typing
+/// at the motivating log's own cadence (an edit every 1-3s) accumulates a
+/// decayed sum in roughly this range within `DENSITY_DECAY_TIME_CONSTANT_SECS`-
+/// scale timeframes; see `DENSITY_DECAY_TIME_CONSTANT_SECS`'s doc comment.
+const MAX_EDIT_DENSITY_COUNTED: f32 = 8.0;
+
+/// Part A #2 / Part C (navigation-density, feeding `DeveloperIntent::
+/// Exploring`): base contribution once the decayed sum
+/// [`RecentActions::navigation_events`] reaches
+/// [`MIN_NAVIGATION_DENSITY_FOR_EXPLORING`] *and* edit activity in the same
+/// window is low (see the `<= MAX_EDIT_DENSITY_FOR_LOW_EDIT_ACTIVITY` check
+/// in `classify`) — dense navigation with real editing alongside it is just
+/// Implementing, not Exploring, so this signal only fires for the
+/// genuinely edit-sparse case.
+const WEIGHT_NAVIGATION_DENSITY: f32 = 0.45;
+/// Bonus per unit of decayed density beyond
+/// [`MIN_NAVIGATION_DENSITY_FOR_EXPLORING`], up to
+/// [`MAX_NAVIGATION_DENSITY_COUNTED`].
+const WEIGHT_NAVIGATION_DENSITY_PER_EXTRA: f32 = 0.05;
+/// Roughly matches the motivating log's own example (four consecutive
+/// selection-changed events with zero edits, landing within a couple of
+/// seconds of each other decays to a sum a little under that raw count —
+/// see `classify`'s doc comment) — deliberately requiring more than one or
+/// two isolated navigations.
+const MIN_NAVIGATION_DENSITY_FOR_EXPLORING: f32 = 2.0;
+const MAX_NAVIGATION_DENSITY_COUNTED: f32 = 8.0;
+/// How much decayed edit-density is still consistent with "low or no edit
+/// activity" for Exploring's purposes — a single incidental fresh edit
+/// (contributing ~1.0) while mostly navigating shouldn't disqualify the
+/// signal, but real, ongoing editing should.
+const MAX_EDIT_DENSITY_FOR_LOW_EDIT_ACTIVITY: f32 = 1.5;
+/// Exploring's own small "still engaged, just not editing" bonus — same
+/// magnitude and reasoning as [`WEIGHT_CONTINUOUS_ACTIVITY`], mirrored here
+/// since Exploring is a distinct "no long pause" state from Implementing.
+const WEIGHT_EXPLORING_CONTINUOUS: f32 = 0.10;
+
+/// Part B (Testing): a test command actually running right now is close to
+/// unambiguous ground truth (the single largest weight in this file,
+/// alongside [`WEIGHT_CURSOR_AT_DIAGNOSTIC`]'s "close to unambiguous"
+/// framing) — see `classify`'s doc comment for the boundary with
+/// `DeveloperIntent::Debugging`'s existing failed-test-run signal.
+const WEIGHT_TEST_RUNNING: f32 = 0.55;
+/// Lower than [`WEIGHT_TEST_RUNNING`]: a test that already finished is
+/// clearly recent testing activity, but a little less "this is happening
+/// right now" than one still in flight. Not dramatically lower, though —
+/// `WEIGHT_CONTINUOUS_ACTIVITY`/`WEIGHT_EXPLORING_CONTINUOUS` both apply
+/// unconditionally whenever `pause_seconds < 10` (regardless of *what*
+/// activity, matching their own existing, independent reasoning), so this
+/// needs enough margin to stay decisive against that baseline rather than
+/// only against zero.
+const WEIGHT_TEST_RECENTLY_PASSED: f32 = 0.45;
+
+/// Part D (Configuring): a single flat weight, not a base-plus-per-extra
+/// scale like the count-driven signals above — file identity is a yes/no
+/// fact, not something that gets *more* true with repetition. Set high
+/// because, like [`WEIGHT_CURSOR_AT_DIAGNOSTIC`] and [`WEIGHT_TEST_RUNNING`],
+/// "actively editing a file recognized as configuration" is close to
+/// unambiguous once it's true at all.
+const WEIGHT_CONFIG_FILE_EDIT: f32 = 0.55;
+
+/// File extensions recognized as configuration for
+/// [`is_recognized_config_file`] — deliberately small and easy to extend
+/// rather than exhaustive, per Part D's own scope.
+const CONFIG_FILE_EXTENSIONS: &[&str] = &["json", "toml", "yaml", "yml", "ini"];
+/// Exact file names (matched case-insensitively) recognized as
+/// configuration even though their extension alone wouldn't be enough to
+/// tell (or, for dotfiles like `.env`, have no conventional extension at
+/// all — see [`is_recognized_config_file`]'s handling of the `.env` family).
+const CONFIG_FILE_NAMES: &[&str] = &[
+    "cargo.toml",
+    "package.json",
+    "tasks.json",
+    "settings.json",
+    "keymap.json",
+    ".editorconfig",
+];
+
+/// Part D: whether `path`'s file name is recognized as a configuration
+/// file — by exact name ([`CONFIG_FILE_NAMES`]), by extension
+/// ([`CONFIG_FILE_EXTENSIONS`]), or as a `.env`-family dotfile (`.env`,
+/// `.env.local`, `.env.production`, ...), which Rust's own `Path::extension`
+/// can't recognize as having an "extension" at all (a leading-dot name with
+/// no further dot, or one more dot, is treated as an extensionless hidden
+/// file, not `name.ext`).
+fn is_recognized_config_file(path: &std::path::Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let file_name_lower = file_name.to_ascii_lowercase();
+    if CONFIG_FILE_NAMES.contains(&file_name_lower.as_str()) || file_name_lower.starts_with(".env")
+    {
+        return true;
+    }
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| CONFIG_FILE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
 
 /// A pause within the "might be investigating" window `[30s, 300s]`
 /// contributes *less* the longer it runs: a pause that just crossed 30s
@@ -1044,15 +1347,34 @@ fn pause_investigating_weight(pause_seconds: u64) -> f32 {
 /// a pause no longer reads as active investigation either). This makes Idle
 /// a real third state grounded in "how long has it actually been," not
 /// purely leftover mass — see [`classify`]'s doc comment.
+///
+/// Cross-checked (classifier-expansion session, Part E — validation only,
+/// curve unchanged this session) against two industry defaults: WakaTime
+/// ends an activity duration after a 2-minute (120s) gap with no file
+/// change; ActivityWatch's default AFK threshold is 3 minutes (180s) of no
+/// keyboard/mouse input. Both are hard step functions at their threshold,
+/// unlike this linear ramp to 300s — a deliberate difference (this file's
+/// own history: a hard cutoff is exactly the "Bug A" cliff shape that
+/// `pause_investigating_weight`/this function were introduced to avoid),
+/// but it does mean this curve is still assigning meaningful non-Idle
+/// weight (`idle_activity_floor(150) ≈ 0.5`) at a pause length both
+/// reference tools would already have fully committed to "away." Worth a
+/// possible follow-up (shortening `PAUSE_INVESTIGATING_MAX_SECS`, or just
+/// the floor's own ramp length) — not changed this session, since it wasn't
+/// this session's scope and the ramp shape itself already has a specific,
+/// documented reason for existing.
 fn idle_activity_floor(pause_seconds: u64) -> f32 {
     (pause_seconds as f32 / PAUSE_INVESTIGATING_MAX_SECS as f32).clamp(0.0, 1.0)
 }
 
-/// Weighted rule-based scoring for [`DeveloperIntent::Debugging`] and
-/// [`DeveloperIntent::Implementing`]. All other intents are stubs (score 0)
-/// except [`DeveloperIntent::Idle`], which has no behavioral rules of its
-/// own either but *is* a real third state in the scoring math below (not
-/// purely 1 minus the other two) — per the phase-4 "start narrow" plan.
+/// Weighted rule-based scoring for [`DeveloperIntent::Debugging`],
+/// [`DeveloperIntent::Implementing`], [`DeveloperIntent::Testing`],
+/// [`DeveloperIntent::Exploring`], and [`DeveloperIntent::Configuring`].
+/// The remaining four (Refactoring, Reviewing, Documenting, Planning) are
+/// still stubs (score 0). [`DeveloperIntent::Idle`] has no behavioral rules
+/// of its own either but *is* a real state in the scoring math below (not
+/// purely leftover mass) — per the phase-4 "start narrow" plan, later
+/// extended by the classifier-expansion session (see "Parts A-D" below).
 ///
 /// ## History (why this looks the way it does)
 ///
@@ -1090,7 +1412,7 @@ fn idle_activity_floor(pause_seconds: u64) -> f32 {
 ///   simply isn't enough to outscore Idle's leftover mass whenever any
 ///   Debugging-flavored signal is present too (e.g. pre-existing diagnostics
 ///   errors, extremely common while mid-edit). Fixed with a new
-///   `RecentActions::large_edits` count over a short `EDIT_BURST_WINDOW`
+///   `RecentActions::large_edits` count over a short `ACTIVITY_BURST_WINDOW`
 ///   (distinct from the 5-minute `RECENT_WINDOW`): the first large edit
 ///   earns only the existing flat weight (numerically identical to before),
 ///   but each *additional* recurrence within the burst window adds
@@ -1113,6 +1435,93 @@ fn idle_activity_floor(pause_seconds: u64) -> f32 {
 /// Debugging/Implementing scoring below — deliberately small priors
 /// ([`WEIGHT_TERMINAL_FOCUS`]/[`WEIGHT_EDITOR_FOCUS`]) or a sharper
 /// correlation signal ([`WEIGHT_CURSOR_AT_DIAGNOSTIC`]), not gates.
+///
+/// ## Parts A-D (classifier-expansion session)
+///
+/// Motivating bug, confirmed from a real logged trace: continuous, gapless
+/// editing (edits firing every 1-3s, no pause) still classified Idle
+/// repeatedly. "Active work" was driven almost entirely by *individual*
+/// edit size (`last_edit_magnitude` >= `LARGE_EDIT_THRESHOLD`), but a
+/// normal editing session is mostly small ~1-char edits punctuated by
+/// occasional larger ones — each small edit correctly scores little alone
+/// (that was Bug B's own fix, above), but nothing captured that *many*
+/// small edits with no gaps is itself real activity.
+///
+/// **Part A** adds two recency-and-frequency-*decayed* signals to
+/// `RecentActions`, independent of each other and of `large_edits`:
+/// `edit_events` (any-size edits — see `WEIGHT_EDIT_DENSITY`, this
+/// session's actual fix) and `navigation_events` (selection-changed
+/// events, feeding Part C). Deliberately *not* a hard rolling-window count
+/// (an earlier revision of this session used one, over `ACTIVITY_BURST_
+/// WINDOW`) — a hard window has an artificial cliff at its boundary (an
+/// edit at t-29s counting fully, one at t-31s counting zero, despite
+/// nothing meaningfully different about them), so instead each event
+/// contributes an exponentially-decaying weight via `decayed_density`
+/// (Mylyn Degree-of-Interest-inspired; see `DENSITY_DECAY_TIME_CONSTANT_
+/// SECS`'s doc comment for the actual decay curve and reasoning), summed
+/// across recent events. `edit_events` is a *continuous relative* of
+/// `large_edits` (every large edit contributes to both, alongside every
+/// small one), so a burst of large edits scores both
+/// `WEIGHT_LARGE_EDIT`/`WEIGHT_EDIT_BURST_EACH_EXTRA` *and*
+/// `WEIGHT_EDIT_DENSITY` — deliberately not treated as double-counting,
+/// since frequency and size are genuinely different evidence for the same
+/// underlying real activity, and a burst of purely *small* edits (no large
+/// ones at all) still needs to be able to score on density alone.
+/// `classify` itself never computes the decay — it only ever sees the
+/// already-decayed `f32` `NucleusEngine::refresh` hands it, which is what
+/// keeps `classify` a pure, deterministic function of its `SessionState`
+/// argument rather than one that implicitly depends on wall-clock time.
+///
+/// **Part B** (`DeveloperIntent::Testing`) is driven entirely by
+/// `state.test_command_running`/`test_command_recently_passed`, which come
+/// from `terminal_watcher`'s plain-terminal command categorization (Phase
+/// 4b-1) — structurally separate from `RecentActions::
+/// {test_runs,failed_test_runs}`, which come from Zed's task runner only.
+/// This separation is what keeps Testing from fighting
+/// `WEIGHT_FAILED_TEST_RUNS` over the same evidence: a *failed* task-runner
+/// test continues to contribute to Debugging exactly as before (Testing's
+/// signals are both false/absent in that case, by construction, not by a
+/// runtime check), while a plain-terminal test that's running or just
+/// passed contributes to Testing, entirely independent of whatever the
+/// task runner separately reports.
+///
+/// **Part C** (`DeveloperIntent::Exploring`) scores Part A's decayed
+/// `navigation_events`, but only when decayed `edit_events` in the same
+/// window is low/absent (`MAX_EDIT_DENSITY_FOR_LOW_EDIT_ACTIVITY`) — dense
+/// navigation *with* real editing alongside it is just Implementing, not a
+/// distinct browsing/reading pattern.
+///
+/// **Part D** (`DeveloperIntent::Configuring`) is file-identity driven, not
+/// behavioral: fires when `edit_events > 0.0` (any recent edit activity —
+/// reusing Part A's decayed signal rather than the never-expiring
+/// `last_edit_magnitude`, so this naturally stops firing once editing
+/// actually stops for a while, not just whenever a config file happens to
+/// be open) *and* the currently-active file (`state.active_files.first()`)
+/// is recognized as configuration (see `is_recognized_config_file`) — a
+/// file merely being open isn't enough; it has to actually be getting
+/// edited.
+///
+/// **Part E** (validation only, no code here): three prior-art cross-checks
+/// against WakaTime/ActivityWatch/HCI-interruptibility research — see the
+/// session report and `docs/PHASE6_INTERRUPTION_NOTES.md`. None of them
+/// changed anything in this function; they're recorded there, not here.
+///
+/// ## Normalization, extended
+///
+/// `idle_score` and `total` now sum all six weighted categories (Debugging,
+/// Implementing, Testing, Exploring, Configuring, and Idle's own score),
+/// not just the original three — required so the three new categories'
+/// probabilities are genuine fractions of the same whole rather than
+/// existing outside the distribution entirely. Winner selection iterates a
+/// fixed priority order and keeps the *first* strictly-non-losing category
+/// on ties, reproducing the original three's exact tie-break behavior
+/// ("ties favor Debugging, then Implementing, over Idle") while giving the
+/// three new categories a deliberate slot each — see the priority-order
+/// comment at the winner-selection code below for the specific ranking and
+/// why. For every pre-existing test scenario (none of which set any of the
+/// three new fields), `testing_score`/`exploring_score`/`configuring_score`
+/// are all exactly `0.0`, so `total` and every existing probability are
+/// numerically identical to before this section existed.
 fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentPrediction {
     if state.agent_active {
         let probabilities = DeveloperIntent::ALL
@@ -1230,9 +1639,26 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
             implementing_score += WEIGHT_EDIT_BURST_EACH_EXTRA * (recurring - 1) as f32;
             implementing_evidence.push(format!(
                 "{recurring} large edits in the last {}s (sustained burst)",
-                EDIT_BURST_WINDOW.as_secs()
+                ACTIVITY_BURST_WINDOW.as_secs()
             ));
         }
+    }
+    // Part A #1: edit-density — independent of `large_edits` above (which
+    // only counts edits >= LARGE_EDIT_THRESHOLD). A dense, recent run of
+    // small edits earns this on its own merits; a dense run of *large*
+    // edits earns both this and the burst bonus above, since they're
+    // genuinely different evidence (frequency vs. size) for the same real
+    // activity, not a double-count of one fact under two names — see
+    // `classify`'s doc comment. `edit_events` is already a recency-decayed
+    // sum (not a raw count) by the time it reaches here.
+    if actions.edit_events >= MIN_EDIT_DENSITY_FOR_SIGNAL {
+        let counted = actions.edit_events.min(MAX_EDIT_DENSITY_COUNTED);
+        implementing_score +=
+            WEIGHT_EDIT_DENSITY + WEIGHT_EDIT_DENSITY_PER_EXTRA * (counted - MIN_EDIT_DENSITY_FOR_SIGNAL);
+        implementing_evidence.push(format!(
+            "frequent recent edits (recency-weighted density {:.1}, decaying over ~{:.0}s)",
+            actions.edit_events, DENSITY_DECAY_TIME_CONSTANT_SECS
+        ));
     }
     if actions.test_runs > 0 && actions.failed_test_runs == 0 {
         implementing_score += WEIGHT_PASSING_TESTS;
@@ -1248,14 +1674,97 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
     }
     implementing_score = implementing_score.min(1.0);
 
-    let idle_score = (1.0 - debugging_score - implementing_score)
+    // --- Testing signals (Part B) ---
+    // Driven entirely by `terminal_watcher`'s plain-terminal command
+    // categorization — structurally separate from `actions.failed_test_runs`
+    // above (which comes from Zed's task runner only), so a currently-
+    // running/just-passed test here can never dilute or be diluted by an
+    // unrelated failed *task* elsewhere. See `classify`'s doc comment for
+    // the full boundary reasoning.
+    let mut testing_score = 0.0f32;
+    let mut testing_evidence = Vec::new();
+    if state.test_command_running {
+        testing_score += WEIGHT_TEST_RUNNING;
+        testing_evidence.push("a test command is currently running in the terminal".to_string());
+    }
+    if state.test_command_recently_passed {
+        testing_score += WEIGHT_TEST_RECENTLY_PASSED;
+        testing_evidence.push(format!(
+            "a test command passed in the terminal within the last {}s",
+            ACTIVITY_BURST_WINDOW.as_secs()
+        ));
+    }
+    testing_score = testing_score.min(1.0);
+
+    // --- Exploring signals (Part C) ---
+    // Navigation-density, gated on edit activity in the same window being
+    // low/absent — dense navigation *with* real editing alongside it is
+    // just Implementing, not a distinct browsing/reading pattern.
+    let mut exploring_score = 0.0f32;
+    let mut exploring_evidence = Vec::new();
+    if actions.navigation_events >= MIN_NAVIGATION_DENSITY_FOR_EXPLORING
+        && actions.edit_events <= MAX_EDIT_DENSITY_FOR_LOW_EDIT_ACTIVITY
+    {
+        let counted = actions.navigation_events.min(MAX_NAVIGATION_DENSITY_COUNTED);
+        exploring_score += WEIGHT_NAVIGATION_DENSITY
+            + WEIGHT_NAVIGATION_DENSITY_PER_EXTRA * (counted - MIN_NAVIGATION_DENSITY_FOR_EXPLORING);
+        exploring_evidence.push(format!(
+            "frequent recent navigation with little/no editing (recency-weighted density {:.1}, \
+            browsing/reading)",
+            actions.navigation_events
+        ));
+    }
+    if state.pause_seconds < 10 {
+        exploring_score += WEIGHT_EXPLORING_CONTINUOUS;
+        exploring_evidence.push("actively navigating, no long pauses".to_string());
+    }
+    exploring_score = exploring_score.min(1.0);
+
+    // --- Configuring signals (Part D) ---
+    // File-identity driven, not behavioral: requires *both* recent edit
+    // activity (any decayed density > 0, i.e. an edit happened within
+    // `DENSITY_RETENTION_WINDOW` — reuses Part A's edit-density signal
+    // rather than `last_edit_magnitude`, which never expires) and that the
+    // currently-active file is a recognized configuration file, so merely
+    // having a config file open without touching it doesn't count.
+    let mut configuring_score = 0.0f32;
+    let mut configuring_evidence = Vec::new();
+    if actions.edit_events > 0.0
+        && let Some(active_file) = state.active_files.first()
+        && is_recognized_config_file(active_file)
+    {
+        configuring_score += WEIGHT_CONFIG_FILE_EDIT;
+        configuring_evidence.push(format!(
+            "editing a recognized configuration file ({})",
+            active_file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| active_file.display().to_string())
+        ));
+    }
+    configuring_score = configuring_score.min(1.0);
+
+    let idle_score = (1.0
+        - debugging_score
+        - implementing_score
+        - testing_score
+        - exploring_score
+        - configuring_score)
         .max(0.0)
         .max(idle_activity_floor(state.pause_seconds));
-    let total = debugging_score + implementing_score + idle_score;
+    let total = debugging_score
+        + implementing_score
+        + idle_score
+        + testing_score
+        + exploring_score
+        + configuring_score;
 
     let debugging_probability = debugging_score / total;
     let implementing_probability = implementing_score / total;
     let idle_probability = idle_score / total;
+    let testing_probability = testing_score / total;
+    let exploring_probability = exploring_score / total;
+    let configuring_probability = configuring_score / total;
 
     let probabilities = DeveloperIntent::ALL
         .into_iter()
@@ -1264,33 +1773,78 @@ fn classify(state: &SessionState, last_edit_magnitude: Option<usize>) -> IntentP
                 DeveloperIntent::Debugging => debugging_probability,
                 DeveloperIntent::Implementing => implementing_probability,
                 DeveloperIntent::Idle => idle_probability,
+                DeveloperIntent::Testing => testing_probability,
+                DeveloperIntent::Exploring => exploring_probability,
+                DeveloperIntent::Configuring => configuring_probability,
                 _ => 0.0,
             };
             (intent, probability)
         })
         .collect();
 
-    let (intent, confidence, evidence) = if debugging_probability >= implementing_probability
-        && debugging_probability >= idle_probability
-    {
+    // Winner selection across all six categories: iterate in a fixed
+    // priority order and only replace the current best on a *strict* win,
+    // so earlier (higher-priority) entries keep exact ties — this
+    // reproduces the pre-expansion behavior exactly for the original three
+    // ("ties favor Debugging, then Implementing, over Idle") while giving
+    // the three new categories a deliberate slot rather than an arbitrary
+    // one:
+    //   1. Testing — a test actually running/just passed is close to
+    //      ground truth, the same "close to unambiguous" tier as
+    //      `WEIGHT_CURSOR_AT_DIAGNOSTIC` below.
+    //   2. Debugging — unchanged top behavioral-inference priority.
+    //   3. Configuring — file-identity is also close to unambiguous once
+    //      its (edit-gated) condition is met, but ranked below Debugging
+    //      since an open error is a sharper signal than "this file has a
+    //      config-shaped name."
+    //   4. Implementing — unchanged.
+    //   5. Exploring — the newest and softest of the added signals
+    //      (frequency-based, no size/identity component), so it sits just
+    //      above Idle rather than contending with the more decisive
+    //      categories above it.
+    //   6. Idle — unchanged lowest-priority fallback.
+    let candidates = [
+        (DeveloperIntent::Testing, testing_probability, testing_evidence),
+        (DeveloperIntent::Debugging, debugging_probability, debugging_evidence),
         (
-            DeveloperIntent::Debugging,
-            debugging_probability,
-            debugging_evidence,
-        )
-    } else if implementing_probability >= idle_probability {
+            DeveloperIntent::Configuring,
+            configuring_probability,
+            configuring_evidence,
+        ),
         (
             DeveloperIntent::Implementing,
             implementing_probability,
             implementing_evidence,
-        )
+        ),
+        (DeveloperIntent::Exploring, exploring_probability, exploring_evidence),
+    ];
+
+    let mut winner: Option<(DeveloperIntent, f32, Vec<String>)> = None;
+    let mut all_evidence = Vec::new();
+    for (intent, probability, evidence) in candidates {
+        if !evidence.is_empty() {
+            all_evidence.push((intent, evidence.clone()));
+        }
+        let is_better = match &winner {
+            Some((_, best_probability, _)) => probability > *best_probability,
+            None => true,
+        };
+        if is_better {
+            winner = Some((intent, probability, evidence));
+        }
+    }
+    let (best_intent, best_probability, best_evidence) =
+        winner.expect("candidates is non-empty, so winner is always set");
+
+    let (intent, confidence, evidence) = if best_probability >= idle_probability {
+        (best_intent, best_probability, best_evidence)
     } else {
-        let evidence = if debugging_evidence.is_empty() && implementing_evidence.is_empty() {
-            vec!["No recent edits, test runs, or diagnostics activity".to_string()]
+        let evidence = if all_evidence.iter().all(|(_, lines)| lines.is_empty()) {
+            vec!["No recent edits, test runs, navigation, or diagnostics activity".to_string()]
         } else {
-            debugging_evidence
+            all_evidence
                 .into_iter()
-                .chain(implementing_evidence)
+                .flat_map(|(_, lines)| lines)
                 .map(|line| format!("{line} (not enough alone to indicate active work)"))
                 .collect()
         };
@@ -1351,6 +1905,8 @@ mod tests {
                 saves: 0,
                 file_switches: 0,
                 large_edits: 0,
+                edit_events: 0.0,
+                navigation_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 0,
@@ -1362,6 +1918,8 @@ mod tests {
             agent_active: false,
             focused_pane: FocusedPane::default(),
             cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
 
         let prediction = classify(&state, None);
@@ -1416,6 +1974,8 @@ mod tests {
                 saves: 0,
                 file_switches: 0,
                 large_edits: 0,
+                edit_events: 0.0,
+                navigation_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 1,
@@ -1427,6 +1987,8 @@ mod tests {
             agent_active: false,
             focused_pane: FocusedPane::default(),
             cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
 
         let prediction = classify(&state, None);
@@ -1465,6 +2027,8 @@ mod tests {
                 saves: 1,
                 file_switches: 0,
                 large_edits: 0,
+                edit_events: 0.0,
+                navigation_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 0,
@@ -1476,6 +2040,8 @@ mod tests {
             agent_active: false,
             focused_pane: FocusedPane::default(),
             cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
 
         let prediction = classify(&state, Some(60));
@@ -1505,6 +2071,8 @@ mod tests {
             agent_active: false,
             focused_pane: FocusedPane::default(),
             cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
 
         let prediction = classify(&state, None);
@@ -1530,6 +2098,8 @@ mod tests {
                 saves: 0,
                 file_switches: 0,
                 large_edits: 0,
+                edit_events: 0.0,
+                navigation_events: 0.0,
             },
             diagnostics: DiagnosticsSummary::default(),
             current_symbol: None,
@@ -1538,6 +2108,8 @@ mod tests {
             agent_active: false,
             focused_pane: FocusedPane::default(),
             cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
 
         let prediction = classify(&state, None);
@@ -1618,6 +2190,8 @@ mod tests {
                 saves: 0,
                 file_switches: 0,
                 large_edits: 0,
+                edit_events: 0.0,
+                navigation_events: 0.0,
             },
             diagnostics: DiagnosticsSummary::default(),
             current_symbol: None,
@@ -1626,6 +2200,8 @@ mod tests {
             agent_active: false,
             focused_pane: FocusedPane::default(),
             cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
 
         let prediction = classify(&state, None);
@@ -1673,6 +2249,8 @@ mod tests {
                 saves: 0,
                 file_switches: 0,
                 large_edits: 3,
+                edit_events: 0.0,
+                navigation_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 16,
@@ -1684,6 +2262,8 @@ mod tests {
             agent_active: false,
             focused_pane: FocusedPane::default(),
             cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
 
         let prediction = classify(&state, Some(220));
@@ -1736,6 +2316,8 @@ mod tests {
                 saves: 0,
                 file_switches: 0,
                 large_edits: 0,
+                edit_events: 0.0,
+                navigation_events: 0.0,
             },
             diagnostics: DiagnosticsSummary::default(),
             current_symbol: None,
@@ -1744,6 +2326,8 @@ mod tests {
             agent_active: false,
             focused_pane: FocusedPane::default(),
             cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
 
         let prediction = classify(&state, Some(80));
@@ -1767,6 +2351,444 @@ mod tests {
             debugging_probability < 1.0 && implementing_probability < 1.0,
             "neither should be a hard 1.0/0.0 split when both have real signal: \
             debugging={debugging_probability}, implementing={implementing_probability}"
+        );
+    }
+
+    // ---- Classifier-expansion session: Part A (activity-density),
+    // Part B (Testing), Part C (Exploring), Part D (Configuring). ----
+
+    // ---- decayed_density: the Part A decay math itself, independent of
+    // classify()'s use of it. ----
+
+    #[test]
+    fn test_decayed_density_is_zero_for_no_events() {
+        let now = Instant::now();
+        assert_eq!(decayed_density(&VecDeque::new(), now), 0.0);
+    }
+
+    #[test]
+    fn test_decayed_density_full_weight_for_a_just_happened_event() {
+        let now = Instant::now();
+        let mut timestamps = VecDeque::new();
+        timestamps.push_back(now);
+        let density = decayed_density(&timestamps, now);
+        assert!(
+            (density - 1.0).abs() < 1e-6,
+            "an event with zero age should contribute ~1.0, got {density}"
+        );
+    }
+
+    /// The defining property of exponential decay with time constant τ:
+    /// after exactly τ seconds, a single event's contribution has dropped
+    /// to `1/e` (~0.368) — not to zero (that's what a hard rolling-window
+    /// cliff would do at its own boundary) and not still 1.0.
+    #[test]
+    fn test_decayed_density_drops_to_one_over_e_after_one_time_constant() {
+        let now = Instant::now();
+        let mut timestamps = VecDeque::new();
+        timestamps.push_back(
+            now - Duration::from_secs_f32(DENSITY_DECAY_TIME_CONSTANT_SECS),
+        );
+        let density = decayed_density(&timestamps, now);
+        let expected = 1.0 / std::f32::consts::E;
+        assert!(
+            (density - expected).abs() < 1e-3,
+            "expected ~{expected:.3} (1/e) one time constant out, got {density}"
+        );
+    }
+
+    #[test]
+    fn test_decayed_density_sums_contributions_across_multiple_events() {
+        let now = Instant::now();
+        let mut timestamps = VecDeque::new();
+        timestamps.push_back(now);
+        timestamps.push_back(now - Duration::from_secs_f32(DENSITY_DECAY_TIME_CONSTANT_SECS));
+        let density = decayed_density(&timestamps, now);
+        let expected = 1.0 + 1.0 / std::f32::consts::E;
+        assert!(
+            (density - expected).abs() < 1e-3,
+            "expected the sum of each event's own contribution (~{expected:.3}), got {density}"
+        );
+    }
+
+    /// The actual bug this decay design exists to fix, checked directly on
+    /// `decayed_density` rather than through `classify`: two events an
+    /// equal, small distance apart in time (one just before, one just after
+    /// where the *old* hard-window design's 30s cliff used to sit) must
+    /// decay to close values, not jump from "counts fully" to "counts not
+    /// at all."
+    #[test]
+    fn test_decayed_density_has_no_cliff_near_the_old_hard_window_boundary() {
+        let now = Instant::now();
+        let mut just_inside = VecDeque::new();
+        just_inside.push_back(now - Duration::from_secs(29));
+        let mut just_outside = VecDeque::new();
+        just_outside.push_back(now - Duration::from_secs(31));
+
+        let inside_density = decayed_density(&just_inside, now);
+        let outside_density = decayed_density(&just_outside, now);
+        assert!(
+            (inside_density - outside_density).abs() < 0.02,
+            "events 2s apart in time must decay smoothly regardless of where the old \
+            hard window boundary used to sit: inside={inside_density}, outside={outside_density}"
+        );
+        // And both must be meaningfully less than a just-happened event's
+        // full 1.0 — decay is real, not a no-op.
+        assert!(inside_density < 0.5 && outside_density < 0.5);
+    }
+
+    fn session_state_with(
+        mutate: impl FnOnce(&mut SessionState),
+    ) -> SessionState {
+        let mut state = SessionState {
+            active_files: vec![PathBuf::from("main.py")],
+            recent_actions: RecentActions::default(),
+            diagnostics: DiagnosticsSummary::default(),
+            current_symbol: None,
+            pause_seconds: 1,
+            diff_summary: None,
+            agent_active: false,
+            focused_pane: FocusedPane::Editor,
+            cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
+        };
+        mutate(&mut state);
+        state
+    }
+
+    /// The motivating bug this session exists to fix, reproduced directly:
+    /// a real logged trace showed continuous, gapless editing (edits firing
+    /// every 1-3 seconds, no pause) still landing as Idle repeatedly — e.g.
+    /// "Idle 42% — small, localized edit (~1 chars changed) (not enough
+    /// alone...); cursor within 2 line(s) of an active error (not enough
+    /// alone...); continuous editing activity, no long pauses (not enough
+    /// alone...)". Root cause: `last_edit_magnitude` only ever reflects the
+    /// single most recent edit, and a normal editing session is mostly
+    /// small ~1-char edits, so the "large edit" signal never fires and
+    /// nothing else captured "many small edits with no gaps is itself real
+    /// activity." This models that exact shape — a tiny most-recent edit,
+    /// but a decayed edit-density of 6.0 (close to what 8 edits spread
+    /// across ~14s at `DENSITY_DECAY_TIME_CONSTANT_SECS`'s scale actually
+    /// sum to — see the constant's own doc comment for the arithmetic),
+    /// plus the same nearby-error/no-pause/editor-focus signals — and
+    /// asserts it now resolves to Implementing, with Idle no longer
+    /// anywhere near dominant.
+    #[test]
+    fn test_dense_small_edits_no_pause_resolves_to_implementing_not_idle() {
+        let state = session_state_with(|state| {
+            state.recent_actions.edit_events = 6.0;
+            state.diagnostics.errors = 2;
+            state.cursor_at_diagnostic = true;
+            state.pause_seconds = 1;
+        });
+
+        let prediction = classify(&state, Some(1));
+        println!(
+            "dense-small-edits: intent={:?} confidence={:.3} probabilities={:?} evidence={:?}",
+            prediction.intent, prediction.confidence, prediction.probabilities, prediction.evidence
+        );
+
+        assert_eq!(
+            prediction.intent,
+            DeveloperIntent::Implementing,
+            "dense small edits with no pause must no longer lose to Idle"
+        );
+        let idle_probability = prediction
+            .probabilities
+            .iter()
+            .find(|(intent, _)| *intent == DeveloperIntent::Idle)
+            .unwrap()
+            .1;
+        assert!(
+            idle_probability < 0.1,
+            "Idle should no longer be anywhere near dominant once edit-density is \
+            accounted for, got {idle_probability}"
+        );
+        assert!(
+            prediction
+                .evidence
+                .iter()
+                .any(|line| line.contains("recency-weighted density")),
+            "evidence should call out the edit-density signal specifically, got {:?}",
+            prediction.evidence
+        );
+    }
+
+    /// Part A #1, isolated: a single fresh edit — whose decayed contribution
+    /// is ~1.0, below `MIN_EDIT_DENSITY_FOR_SIGNAL` (2.0) — must not trigger
+    /// the density signal, preserving the existing "a lone small edit alone
+    /// is not enough" principle
+    /// (`test_pause_alone_lands_on_idle_at_low_debugging_confidence`'s whole
+    /// reason for existing) rather than making every edit, however
+    /// isolated, look like sustained activity.
+    #[test]
+    fn test_lone_edit_does_not_trigger_density_signal() {
+        let state = session_state_with(|state| {
+            state.recent_actions.edit_events = 1.0;
+        });
+
+        let prediction = classify(&state, Some(1));
+        assert!(
+            !prediction
+                .evidence
+                .iter()
+                .any(|line| line.contains("recency-weighted density")),
+            "a single edit_events must not trigger the density signal, got {:?}",
+            prediction.evidence
+        );
+    }
+
+    /// Part B: a test command currently running in a plain terminal must
+    /// win as Testing, with meaningfully high confidence.
+    #[test]
+    fn test_running_test_command_resolves_to_testing() {
+        let state = session_state_with(|state| {
+            state.test_command_running = true;
+            state.focused_pane = FocusedPane::Terminal;
+        });
+
+        let prediction = classify(&state, None);
+        println!(
+            "test-running: intent={:?} confidence={:.3} probabilities={:?} evidence={:?}",
+            prediction.intent, prediction.confidence, prediction.probabilities, prediction.evidence
+        );
+
+        assert_eq!(prediction.intent, DeveloperIntent::Testing);
+        assert!(
+            prediction.confidence > 0.4,
+            "a currently-running test command should be meaningfully confident Testing, \
+            got {}",
+            prediction.confidence
+        );
+    }
+
+    /// Part B: a test command that just passed (not currently running)
+    /// must also win as Testing, at a somewhat lower confidence than the
+    /// in-flight case (see `WEIGHT_TEST_RECENTLY_PASSED` <
+    /// `WEIGHT_TEST_RUNNING`).
+    #[test]
+    fn test_recently_passed_test_command_resolves_to_testing() {
+        let state = session_state_with(|state| {
+            state.test_command_recently_passed = true;
+        });
+
+        let prediction = classify(&state, None);
+        println!(
+            "test-recently-passed: intent={:?} confidence={:.3} probabilities={:?}",
+            prediction.intent, prediction.confidence, prediction.probabilities
+        );
+
+        assert_eq!(prediction.intent, DeveloperIntent::Testing);
+    }
+
+    /// Part B boundary check: a *failed* test/task run (the existing,
+    /// unrelated `RecentActions::failed_test_runs` path, driven by Zed's
+    /// task runner) must still resolve to Debugging exactly as before —
+    /// Testing's new signals are driven entirely by
+    /// `test_command_running`/`test_command_recently_passed`, which are
+    /// both false/absent here, so there is no path by which adding Testing
+    /// could have regressed this existing behavior. Directly re-runs
+    /// `test_multiple_failed_test_runs_is_confident_debugging`'s scenario
+    /// through the expanded classifier to confirm that explicitly, not just
+    /// by construction.
+    #[test]
+    fn test_failed_test_runs_still_resolve_to_debugging_not_testing() {
+        let state = SessionState {
+            active_files: vec![
+                PathBuf::from("test_calculator.py"),
+                PathBuf::from("calculator.py"),
+            ],
+            recent_actions: RecentActions {
+                test_runs: 3,
+                failed_test_runs: 3,
+                ..RecentActions::default()
+            },
+            diagnostics: DiagnosticsSummary {
+                errors: 1,
+                warnings: 0,
+            },
+            current_symbol: None,
+            pause_seconds: 38,
+            diff_summary: None,
+            agent_active: false,
+            focused_pane: FocusedPane::default(),
+            cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
+        };
+
+        let prediction = classify(&state, None);
+        assert_eq!(
+            prediction.intent,
+            DeveloperIntent::Debugging,
+            "a failed test/task run must continue to resolve to Debugging, unaffected by \
+            the new Testing intent existing"
+        );
+    }
+
+    /// Part C: dense navigation (selection-changed events) with no editing
+    /// and no long pause must resolve to Exploring — the exact shape from
+    /// the motivating log (four consecutive selection-changed events, zero
+    /// edits in between).
+    #[test]
+    fn test_dense_navigation_with_no_edits_resolves_to_exploring() {
+        let state = session_state_with(|state| {
+            state.recent_actions.navigation_events = 3.6;
+            state.recent_actions.edit_events = 0.0;
+            state.pause_seconds = 2;
+        });
+
+        let prediction = classify(&state, None);
+        println!(
+            "dense-navigation: intent={:?} confidence={:.3} probabilities={:?} evidence={:?}",
+            prediction.intent, prediction.confidence, prediction.probabilities, prediction.evidence
+        );
+
+        assert_eq!(prediction.intent, DeveloperIntent::Exploring);
+        assert!(
+            prediction
+                .evidence
+                .iter()
+                .any(|line| line.contains("recency-weighted density") && line.contains("browsing")),
+            "evidence should call out the navigation-density signal specifically, got {:?}",
+            prediction.evidence
+        );
+    }
+
+    /// Part C boundary: dense navigation *with* real editing alongside it
+    /// in the same window must not resolve to Exploring — that's just
+    /// Implementing, per Part A's own scoping ("specifically when
+    /// edit-density is low/absent in that same window").
+    #[test]
+    fn test_dense_navigation_with_concurrent_editing_is_not_exploring() {
+        let state = session_state_with(|state| {
+            state.recent_actions.navigation_events = 3.6;
+            state.recent_actions.edit_events = 6.0;
+        });
+
+        let prediction = classify(&state, Some(1));
+        assert_ne!(
+            prediction.intent,
+            DeveloperIntent::Exploring,
+            "navigation density alongside real concurrent editing should not read as \
+            Exploring, got {:?}",
+            prediction
+        );
+    }
+
+    /// Part D: editing a recognized configuration file (`Cargo.toml`) must
+    /// resolve to Configuring.
+    #[test]
+    fn test_editing_config_file_resolves_to_configuring() {
+        let state = session_state_with(|state| {
+            state.active_files = vec![PathBuf::from("Cargo.toml")];
+            state.recent_actions.edit_events = 2.0;
+        });
+
+        let prediction = classify(&state, Some(5));
+        println!(
+            "config-file-edit: intent={:?} confidence={:.3} probabilities={:?} evidence={:?}",
+            prediction.intent, prediction.confidence, prediction.probabilities, prediction.evidence
+        );
+
+        assert_eq!(prediction.intent, DeveloperIntent::Configuring);
+        assert!(
+            prediction
+                .evidence
+                .iter()
+                .any(|line| line.contains("configuration file")),
+            "evidence should call out the config-file signal specifically, got {:?}",
+            prediction.evidence
+        );
+    }
+
+    /// Part D boundary: a recognized config file merely *open* (no recent
+    /// edit activity) must not trigger Configuring — the signal requires
+    /// actual recent edits, not just the file being active.
+    #[test]
+    fn test_config_file_open_without_edits_is_not_configuring() {
+        let state = session_state_with(|state| {
+            state.active_files = vec![PathBuf::from("Cargo.toml")];
+            state.recent_actions.edit_events = 0.0;
+        });
+
+        let prediction = classify(&state, None);
+        assert_ne!(
+            prediction.intent,
+            DeveloperIntent::Configuring,
+            "a config file merely open with no recent edits should not trigger \
+            Configuring, got {:?}",
+            prediction
+        );
+    }
+
+    /// Part D boundary: editing a non-config file must not trigger
+    /// Configuring, even with real edit-density.
+    #[test]
+    fn test_editing_non_config_file_is_not_configuring() {
+        let state = session_state_with(|state| {
+            state.active_files = vec![PathBuf::from("main.py")];
+            state.recent_actions.edit_events = 6.0;
+        });
+
+        let prediction = classify(&state, Some(5));
+        assert_ne!(
+            prediction.intent,
+            DeveloperIntent::Configuring,
+            "editing an ordinary source file should not trigger Configuring, got {:?}",
+            prediction
+        );
+    }
+
+    /// Part D: `.env`-family dotfiles are recognized even though they have
+    /// no extension `Path::extension()` can see, and even though `.env`
+    /// itself isn't a `CONFIG_FILE_EXTENSIONS` entry.
+    #[test]
+    fn test_dotenv_family_files_are_recognized_as_config() {
+        assert!(is_recognized_config_file(std::path::Path::new(".env")));
+        assert!(is_recognized_config_file(std::path::Path::new(
+            ".env.local"
+        )));
+        assert!(is_recognized_config_file(std::path::Path::new(
+            ".env.production"
+        )));
+        assert!(!is_recognized_config_file(std::path::Path::new(
+            "main.py"
+        )));
+    }
+
+    /// Normalization sanity check: with all six weighted categories now
+    /// contributing, probabilities must still sum to ~1.0 and stay in
+    /// range for a state where several signals from *different* new and
+    /// old categories are simultaneously true — not just checked in
+    /// isolation per-category above.
+    #[test]
+    fn test_probabilities_stay_well_formed_with_multiple_new_signals_active() {
+        let state = session_state_with(|state| {
+            state.recent_actions.edit_events = 5.0;
+            state.recent_actions.navigation_events = 3.6;
+            state.test_command_recently_passed = true;
+            state.active_files = vec![PathBuf::from("Cargo.toml")];
+            state.diagnostics.errors = 1;
+        });
+
+        let prediction = classify(&state, Some(3));
+        println!(
+            "multi-signal: intent={:?} confidence={:.3} probabilities={:?}",
+            prediction.intent, prediction.confidence, prediction.probabilities
+        );
+
+        let sum: f32 = prediction
+            .probabilities
+            .iter()
+            .map(|(_, probability)| probability)
+            .sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-3,
+            "probabilities must still sum to ~1.0 with multiple new signals active, \
+            got {sum}: {:?}",
+            prediction.probabilities
         );
     }
 
@@ -1804,6 +2826,8 @@ mod tests {
                 saves: 1,
                 file_switches: 0,
                 large_edits: 0,
+                edit_events: 0.0,
+                navigation_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 2,
@@ -1815,6 +2839,8 @@ mod tests {
             agent_active: false,
             focused_pane: FocusedPane::default(),
             cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
         logger.log_intent_prediction(&prediction, &session_state);
         logger.log_raw_event(&RawEvent::Edit {
@@ -1943,6 +2969,8 @@ mod tests {
                 saves: 0,
                 file_switches: 0,
                 large_edits: 0,
+                edit_events: 0.0,
+                navigation_events: 0.0,
             },
             diagnostics: DiagnosticsSummary {
                 errors: 2,
@@ -1954,6 +2982,8 @@ mod tests {
             agent_active: true,
             focused_pane: FocusedPane::Terminal,
             cursor_at_diagnostic: true,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
 
         let prediction = classify(&state, None);
@@ -1998,6 +3028,8 @@ mod tests {
             agent_active: false,
             focused_pane: FocusedPane::Other,
             cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
 
         for focused_pane in [FocusedPane::Terminal, FocusedPane::Editor] {
@@ -2058,6 +3090,8 @@ mod tests {
             agent_active: false,
             focused_pane: FocusedPane::Other,
             cursor_at_diagnostic: false,
+            test_command_running: false,
+            test_command_recently_passed: false,
         };
 
         let elsewhere = classify(&base, None);
@@ -2174,9 +3208,30 @@ mod classify_stress_tests {
             any::<u32>(),
             any::<u32>(),
             any::<u32>(),
+            // Full f32 range, deliberately including NaN/Infinity/negative
+            // values a real engine's `decayed_density` could never actually
+            // produce (that function only ever sums positive
+            // `exp(-age/tau)` terms) — the whole point of this stress
+            // module is checking `classify` stays well-behaved even for
+            // shapes the real engine wouldn't produce, and every use of
+            // these two fields in `classify` is behind a comparison
+            // (`>=`/`<=`/`>`), which is always `false` for NaN, so a NaN
+            // input is expected to just skip the relevant signal rather
+            // than propagate into the output — exactly what
+            // `classify_never_violates_its_own_contract` checks below.
+            any::<f32>(),
+            any::<f32>(),
         )
             .prop_map(
-                |(test_runs, failed_test_runs, saves, file_switches, large_edits)| {
+                |(
+                    test_runs,
+                    failed_test_runs,
+                    saves,
+                    file_switches,
+                    large_edits,
+                    edit_events,
+                    navigation_events,
+                )| {
                     RecentActions {
                         test_runs,
                         // failed_test_runs is meaningless above test_runs in
@@ -2185,11 +3240,15 @@ mod classify_stress_tests {
                         // enforced by the type system — deliberately
                         // generated independently to check classify() is
                         // robust to a shape the real engine would never
-                        // produce, not just shapes it would.
+                        // produce, not just shapes it would. Same reasoning
+                        // extends to edit_events/navigation_events below
+                        // (also generated independently of large_edits).
                         failed_test_runs,
                         saves,
                         file_switches,
                         large_edits,
+                        edit_events,
+                        navigation_events,
                     }
                 },
             )
@@ -2202,6 +3261,19 @@ mod classify_stress_tests {
         })
     }
 
+    /// Occasionally generates a recognized-config-file path (exercising
+    /// `DeveloperIntent::Configuring`'s condition under stress too, not
+    /// just leaving `active_files` always empty), alongside plain/empty
+    /// shapes.
+    fn active_files_strategy() -> impl Strategy<Value = Vec<PathBuf>> {
+        prop_oneof![
+            Just(Vec::new()),
+            Just(vec![PathBuf::from("main.py")]),
+            Just(vec![PathBuf::from("Cargo.toml")]),
+            Just(vec![PathBuf::from(".env")]),
+        ]
+    }
+
     fn session_state_strategy() -> impl Strategy<Value = SessionState> {
         (
             recent_actions_strategy(),
@@ -2210,11 +3282,24 @@ mod classify_stress_tests {
             any::<bool>(),
             focused_pane_strategy(),
             any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            active_files_strategy(),
         )
             .prop_map(
-                |(recent_actions, diagnostics, pause_seconds, agent_active, focused_pane, cursor_at_diagnostic)| {
+                |(
+                    recent_actions,
+                    diagnostics,
+                    pause_seconds,
+                    agent_active,
+                    focused_pane,
+                    cursor_at_diagnostic,
+                    test_command_running,
+                    test_command_recently_passed,
+                    active_files,
+                )| {
                     SessionState {
-                        active_files: Vec::new(),
+                        active_files,
                         recent_actions,
                         diagnostics,
                         current_symbol: None,
@@ -2223,6 +3308,8 @@ mod classify_stress_tests {
                         agent_active,
                         focused_pane,
                         cursor_at_diagnostic,
+                        test_command_running,
+                        test_command_recently_passed,
                     }
                 },
             )

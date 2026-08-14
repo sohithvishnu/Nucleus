@@ -121,6 +121,13 @@ pub struct ThemeColors {
     // UI Elements
     // ===
     pub status_bar_background: Hsla,
+    /// Text/icon color for items in the status bar. Defaults to `text` (see
+    /// `default_colors.rs`) — themes that don't specifically care about the
+    /// status bar's foreground get identical behavior to before this field
+    /// existed; a theme only needs to set `status_bar.foreground` in its
+    /// JSON if its status bar background doesn't pair well with its general
+    /// `text`/`icon` color.
+    pub status_bar_foreground: Hsla,
     pub title_bar_background: Hsla,
     pub title_bar_inactive_background: Hsla,
     pub toolbar_background: Hsla,
@@ -376,6 +383,7 @@ pub enum ThemeColorField {
     IconPlaceholder,
     IconAccent,
     StatusBarBackground,
+    StatusBarForeground,
     TitleBarBackground,
     TitleBarInactiveBackground,
     ToolbarBackground,
@@ -492,6 +500,7 @@ impl ThemeColors {
             ThemeColorField::IconPlaceholder => self.icon_placeholder,
             ThemeColorField::IconAccent => self.icon_accent,
             ThemeColorField::StatusBarBackground => self.status_bar_background,
+            ThemeColorField::StatusBarForeground => self.status_bar_foreground,
             ThemeColorField::TitleBarBackground => self.title_bar_background,
             ThemeColorField::TitleBarInactiveBackground => self.title_bar_inactive_background,
             ThemeColorField::ToolbarBackground => self.toolbar_background,

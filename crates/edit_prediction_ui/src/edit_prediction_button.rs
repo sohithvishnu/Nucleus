@@ -108,6 +108,7 @@ impl Render for EditPredictionButton {
                     return div().child(
                         IconButton::new("copilot-error", icon)
                             .icon_size(IconSize::Small)
+                            .icon_color(Color::Custom(cx.theme().colors().status_bar_foreground))
                             .tab_index(0isize)
                             .aria_label("GitHub Copilot")
                             .on_click(cx.listener(move |_, _, window, cx| {
@@ -175,6 +176,7 @@ impl Render for EditPredictionButton {
                         .anchor(Anchor::BottomRight)
                         .trigger_with_tooltip(
                             IconButton::new("copilot-icon", icon)
+                                .icon_color(Color::Custom(cx.theme().colors().status_bar_foreground))
                                 .tab_index(0isize)
                                 .aria_label("GitHub Copilot"),
                             |_window, cx| Tooltip::for_action("GitHub Copilot", &ToggleMenu, cx),
@@ -222,6 +224,7 @@ impl Render for EditPredictionButton {
                         .trigger_with_tooltip(
                             IconButton::new("codestral-icon", IconName::AiMistral)
                                 .shape(IconButtonShape::Square)
+                                .icon_color(Color::Custom(cx.theme().colors().status_bar_foreground))
                                 .tab_index(0isize)
                                 .aria_label("Edit Prediction")
                                 .when(!has_api_key, |this| {
@@ -268,6 +271,7 @@ impl Render for EditPredictionButton {
                         .trigger(
                             IconButton::new("openai-compatible-api-icon", IconName::AiOpenAiCompat)
                                 .shape(IconButtonShape::Square)
+                                .icon_color(Color::Custom(cx.theme().colors().status_bar_foreground))
                                 .tab_index(0isize)
                                 .aria_label("Edit Prediction")
                                 .when(!enabled, |this| {
@@ -300,6 +304,7 @@ impl Render for EditPredictionButton {
                         .trigger_with_tooltip(
                             IconButton::new("ollama-icon", IconName::AiOllama)
                                 .shape(IconButtonShape::Square)
+                                .icon_color(Color::Custom(cx.theme().colors().status_bar_foreground))
                                 .tab_index(0isize)
                                 .aria_label("Edit Prediction")
                                 .when(!enabled, |this| {
@@ -385,6 +390,7 @@ impl Render for EditPredictionButton {
                     return div().child(
                         IconButton::new("zed-predict-pending-button", ep_icon)
                             .shape(IconButtonShape::Square)
+                            .icon_color(Color::Custom(cx.theme().colors().status_bar_foreground))
                             .tab_index(0isize)
                             .aria_label("Edit Predictions")
                             .indicator(Indicator::dot().color(Color::Muted))
@@ -442,6 +448,7 @@ impl Render for EditPredictionButton {
 
                 let icon_button = IconButton::new("zed-predict-pending-button", ep_icon)
                     .shape(IconButtonShape::Square)
+                    .icon_color(Color::Custom(cx.theme().colors().status_bar_foreground))
                     .tab_index(0isize)
                     .aria_label("Edit Prediction")
                     .when_some(indicator_color, |this, color| {
